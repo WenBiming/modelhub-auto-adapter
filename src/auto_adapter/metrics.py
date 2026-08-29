@@ -14,3 +14,7 @@ def incr(name: str, n: int = 1) -> None:
 
 def flush_tick_summary() -> None:
     print(json.dumps({"metrics": dict(_counters)}), file=sys.stdout, flush=True)
+
+
+def reset() -> None:
+    _counters.clear()
