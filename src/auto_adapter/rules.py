@@ -12,7 +12,8 @@ FALLBACK_TASK_TYPE_RULES: list[tuple[str, str]] = [
     ("whisper", "automatic-speech-recognition"),
 ]
 
-# vllm 支持的模型架构（config.json 的 architectures 字段）
+# vllm 支持的模型架构（config.json 的 architectures 字段）。
+# 预留用于后续迭代的架构级 framework 判断；v0.1 未使用（按 task_type 代替）。
 VLLM_SUPPORTED_ARCHITECTURES: set[str] = {
     "LlamaForCausalLM",
     "Qwen2ForCausalLM",

@@ -38,6 +38,17 @@ def test_render_config_params_is_valid_yaml_with_consistent_tp():
     assert cfg["sut_config"]["gpu_num"] == "2"
 
 
+def test_render_config_params_transformers_template():
+    text = config_gen.render_config_params("transformers", tp_size=4, max_model_len=8192)
+    cfg = yaml.safe_load(text)
+    assert cfg["framework"] == "transformers"
+    sut_cmd = cfg["sut_config"]["values"]["command"]
+    ref_cmd = cfg["ref_config"]["values"]["command"]
+    assert sut_cmd[sut_cmd.index("-tp") + 1] == "4"
+    assert ref_cmd[ref_cmd.index("-tp") + 1] == "4"
+    assert cfg["sut_config"]["gpu_num"] == "4"
+
+
 def test_select_target_gpu_prefers_lowest_coverage(tmp_path):
     store = SqliteStorage(str(tmp_path / "t.db"))
     assert config_gen.select_target_gpu(store) == "MetaX_c-500"  # 空覆盖率时取 KNOWN_GPUS[0]

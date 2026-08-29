@@ -42,7 +42,9 @@ def resolve_framework(candidate) -> str:
     """架构在 vllm 支持列表 → vllm；否则退化到备选框架（rules.py 维护）。"""
     if candidate.model_id in rules.MANUAL_OVERRIDES:
         return rules.MANUAL_OVERRIDES[candidate.model_id][1]
-    # v0.1：text-generation 走 vllm，其余退化（架构级判断见 spec §6 迭代方向）
+    # v0.1 范围：按 task_type 选框架（计划 Global Constraints 的 YAGNI 决定）。
+    # spec §4.4 要求的"按模型架构判断 vllm 支持"是后续迭代项——CandidateModel
+    # 目前不携带 architecture 字段，需先扩展发现层才能实现。
     if resolve_task_type(candidate) == "text-generation":
         return "vllm"
     return rules.FALLBACK_FRAMEWORK
