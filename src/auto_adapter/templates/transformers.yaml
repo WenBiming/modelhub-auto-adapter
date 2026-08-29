@@ -1,0 +1,40 @@
+# transformers 场景 configParams 模板（spec 附录 A.1.1）。
+# 非 vllm 框架暂无正式模板；command 字段结构为占位符，待平台确认后修正（spec §9 开放问题）。
+# 占位符 {tp_size}/{max_model_len}/{gpu_mem_util} 由 config_gen 填充后
+# 整体序列化为 YAML 字符串放入 configParams 字段。
+framework: transformers
+api: completion
+lang: en
+max_model_len: "{max_model_len}"
+max_tokens: 1024
+temperature: 0.7
+repetition_penalty: 1.1
+top_p: 0.9
+sut_config:
+  gpu_num: "{tp_size}"
+  values:
+    command:
+      - /opt/conda/bin/python
+      - /model/serve.py
+      - --port
+      - "20644"
+      - --max-model-len
+      - "{max_model_len}"
+      - --gpu-memory-utilization
+      - "{gpu_mem_util}"
+      - -tp
+      - "{tp_size}"
+      - --trust-remote-code
+ref_config:
+  gpu_num: "{tp_size}"
+  values:
+    command:
+      - python
+      - /model/serve.py
+      - --port
+      - "80"
+      - --max-model-len
+      - "{max_model_len}"
+      - -tp
+      - "{tp_size}"
+      - --trust-remote-code
