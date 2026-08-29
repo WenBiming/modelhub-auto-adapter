@@ -1,0 +1,9 @@
+# vllm 场景 configParams 模板（spec §4.4；占位符由 config_gen 填充）
+engine: vllm
+launch_command: >
+  python -m vllm.entrypoints.openai.api_server
+  --model {model_local_path}
+  --tensor-parallel-size {tp_size}
+  --port {port}
+port: 8000
+tp_size: "{tp_size}"
