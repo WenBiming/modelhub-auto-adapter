@@ -42,4 +42,17 @@ def evaluate(
     - 候选命中悬赏                      → ENQUEUE, BOUNTY（覆盖上面的优先级）
     - search_model 抛异常/网络失败       → SKIP_UNCERTAIN（宁漏勿重）
     """
-    raise NotImplementedError
+    if storage.get_task(candidate.model_id, target_gpu) is not None:
+        return Decision(Verdict.SKIP_DUPLICATE, reason="local record exists")
+    try:
+        result = client.search_model(candidate.model_id)
+    except Exception as e:  # 平台不可知时宁漏勿重
+        return Decision(Verdict.SKIP_UNCERTAIN, reason=f"platform query failed: {e}")
+    if target_gpu in result.verify_result:
+        # GpuVerifyResult 内部字段未确认前，键存在即视为已覆盖（保守）
+        return Decision(Verdict.SKIP_DUPLICATE, reason=f"already verified on {target_gpu}")
+    if candidate.is_bounty:
+        return Decision(Verdict.ENQUEUE, Priority.BOUNTY, reason="bounty")
+    if not result.verify_result:
+        return Decision(Verdict.ENQUEUE, Priority.NEW_MODEL, reason="no adaptation record")
+    return Decision(Verdict.ENQUEUE, Priority.NEW_ADAPTATION, reason="new gpu for model")
