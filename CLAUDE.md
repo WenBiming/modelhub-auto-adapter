@@ -22,5 +22,12 @@ ModelHub XC「适配智能体」：自动发现 HF/ModelScope 模型并通过开
 - 测试不打真实网络：平台 API 用 `responses` mock，storage 用内存 SQLite。
 
 ## 当前状态
-骨架阶段：接口与数据模型已定，函数体多为 `NotImplementedError` 占位。
-按 spec §8 的里程碑 M1→M6 顺序实现；动手前先读 spec §9 的开放问题。
+M1–M6 均已实现：健康检查 + SIGTERM 优雅停机、HF/悬赏发现、去重与资格判定、
+配置生成与入库、限流提交、对账监控与失败分类退避、全链路 tick 接线，均有测试
+覆盖。测试：`.venv/bin/pytest`（全绿，无 skip 占位残留）。
+
+上线前仍需人工核对（不属于代码任务，见 spec §9 及 DoD）：
+- 用真实平台 `status`/`verifyResult` 枚举值回填 `rules.PLATFORM_STATUS_MAP`
+  （当前为占位映射）；
+- 按实际可用算力扩充 `rules.KNOWN_GPUS`（当前仅 `MetaX_c-500` 一项）；
+- 准备生产环境的悬赏 JSON 配置文件（`BOUNTY_CONFIG_PATH` 指向的人工维护列表）。

@@ -1,5 +1,7 @@
 # 平台合规要求：官方轻量基础镜像 + EXPOSE 端口 + /health 端点（见 spec §4.9）
-FROM modelhubxc-4pd.tencentcloudcr.com/xc_agent_platform/python:3.11-slim
+# BASE_IMAGE 可通过 --build-arg 覆盖，便于本地无法访问平台 registry 时用公共镜像验证构建
+ARG BASE_IMAGE=modelhubxc-4pd.tencentcloudcr.com/xc_agent_platform/python:3.11-slim
+FROM ${BASE_IMAGE}
 
 WORKDIR /app
 COPY pyproject.toml ./
