@@ -190,6 +190,9 @@ QUEUED ──submit──▶ PENDING ──▶ RUNNING ──▶ SUCCESS
 
 ## 8. 实现里程碑（供 Claude Code 按序执行）
 
+> 详细任务级实现计划（含测试与实现代码）见
+> `docs/superpowers/plans/2026-08-29-auto-model-adapter.md`，以计划文档为执行依据。
+
 1. **M1 基座**：models.py / settings.py / storage(sqlite) / health / main 循环骨架 + SIGTERM，测试：storage 幂等、健康检查、优雅停机；
 2. **M2 平台客户端**：platform_client 全部方法 + responses 单测；
 3. **M3 准入链路**：discovery(bounty 优先) → eligibility → 入队，测试分类矩阵；
