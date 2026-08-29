@@ -76,6 +76,10 @@ class SqliteStorage:
             "SELECT payload FROM candidates WHERE processed = 0").fetchall()
         return [_load_candidate(r[0]) for r in rows]
 
+    def has_candidate(self, model_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM candidates WHERE model_id = ?", (model_id,)).fetchone() is not None
+
     def mark_candidate_processed(self, model_id: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -146,7 +150,11 @@ class SqliteStorage:
         self._kv_set("gpu_coverage", coverage)
 
     def kill_switch(self) -> bool:
-        return self._kv_get("kill_switch", {"on": False})["on"]
+        return self.kill_switch_state()["on"]
+
+    def kill_switch_state(self) -> dict:
+        state = self._kv_get("kill_switch", {"on": False, "reason": ""})
+        return {"on": bool(state.get("on")), "reason": state.get("reason", "")}
 
     def set_kill_switch(self, on: bool, reason: str) -> None:
         self._kv_set("kill_switch", {"on": on, "reason": reason})

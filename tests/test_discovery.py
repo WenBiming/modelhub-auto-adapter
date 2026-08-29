@@ -11,12 +11,13 @@ from auto_adapter.storage.sqlite import SqliteStorage
 
 
 @responses.activate
-def test_huggingface_fetch_and_throttle():
+def test_huggingface_fetch_and_throttle(tmp_path):
     responses.get("https://huggingface.co/api/models", json=[
         {"modelId": "Qwen/Qwen2.5-7B-Instruct", "pipeline_tag": "text-generation"},
         {"id": "org/other-13B", "pipeline_tag": "text-generation"},
     ])
-    src = HuggingFaceSource(limit=2, min_interval_seconds=3600)
+    store = SqliteStorage(str(tmp_path / "t.db"))
+    src = HuggingFaceSource(store, limit=2, min_interval_seconds=3600)
     got = src.fetch()
     assert [c.model_id for c in got] == ["Qwen/Qwen2.5-7B-Instruct", "org/other-13B"]
     assert got[0].params_size == "7B"
@@ -32,6 +33,11 @@ def test_huggingface_fetch_and_throttle():
 
     assert src.fetch() == []  # 节流：1h 内第二次返回空
     assert len(responses.calls) == 1  # 仍然只有一次调用
+
+    # M2 safety property: the throttle lives in storage, not in process memory — a fresh
+    # source object (i.e. a restarted process, or a crash loop) must stay throttled.
+    assert HuggingFaceSource(store, limit=2, min_interval_seconds=3600).fetch() == []
+    assert len(responses.calls) == 1
 
 
 def test_manual_bounty_source(tmp_path):
@@ -114,3 +120,40 @@ def test_bounty_wins_dedup(tmp_path):
     assert len(stored) == 1
     assert stored[0].is_bounty is True
     assert stored[0].bounty_deadline == bounty_deadline
+
+
+def test_manual_bounty_source_normalizes_naive_deadline(tmp_path):
+    """I1: a hand-maintained bounty file will sooner or later carry a deadline with no
+    UTC offset. A naive datetime flowing downstream makes `deadline - now` raise
+    TypeError in submitter.drain and failure.handle, killing the pipeline every tick."""
+    path = tmp_path / "bounty.json"
+    path.write_text(json.dumps([{
+        "model_id": "org/bounty-model",
+        "model_url": "https://huggingface.co/org/bounty-model",
+        "deadline": "2026-09-30T00:00:00",  # no offset — the easy hand-written mistake
+    }]))
+
+    got = ManualBountySource(str(path)).fetch()
+
+    assert got[0].bounty_deadline.tzinfo is not None
+    assert got[0].bounty_deadline == datetime(2026, 9, 30, tzinfo=timezone.utc)
+    # and the value is directly usable in an aware arithmetic expression
+    assert got[0].bounty_deadline > datetime(2026, 8, 29, tzinfo=timezone.utc)
+
+
+def test_run_counts_only_genuinely_new_candidates(tmp_path, candidate):
+    """M1: run() feeds main's candidates_discovered metric. Counting every deduped
+    candidate it saw would make that number equal the fetch size on every tick, so
+    "what turned up this tick" would be unreadable."""
+    store = SqliteStorage(str(tmp_path / "t.db"))
+
+    class Fake:
+        name = "fake"
+        def fetch(self):
+            return [candidate]
+
+    assert run([Fake()], store) == 1
+    assert run([Fake()], store) == 0  # same candidate again: nothing new
+
+    store.mark_candidate_processed(candidate.model_id)
+    assert run([Fake()], store) == 0  # already-known even after processing
