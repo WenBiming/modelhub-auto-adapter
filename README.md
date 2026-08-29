@@ -35,6 +35,18 @@ docker run -p 8080:8080 \
 
 健康检查：`GET :8080/health`。
 
+默认基础镜像是平台 registry（本机通常不可达）。本地验证构建时用公共镜像覆盖：
+
+```bash
+docker build --build-arg BASE_IMAGE=python:3.11-slim -t auto-adapter .
+```
+
+**这一步是合并前的必过门禁**，不能只靠 `pytest`：测试跑在 editable 安装上，
+`Path(__file__).parent` 会落到源码树，因此看不到"`templates/*.yaml` 没打进 wheel"
+这类打包缺陷——而容器用的是 `pip install .`，缺了模板会在第一个候选渲染时抛
+`FileNotFoundError`，整条流水线在 submitter 之前就中断，而 `/health` 照常返回 200。
+`tests/test_packaging.py` 用 `importlib.resources` 守住了这一点，但真正的构建仍要跑一次。
+
 ## 运维：熔断开关（kill switch）
 
 熔断开关是本系统唯一的安全刹车：一旦打开，`submitter.drain` 立即停止提交任何任务
