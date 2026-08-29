@@ -8,12 +8,15 @@ from .storage import Storage
 
 # 日志关键词 → 失败类型（实现时依据真实日志样本补全）
 _ENGINE_PATTERNS = ("CUDA out of memory", "CUDA error", "container failed", "OOM")
-_QUALITY_PATTERNS = ("judge", "quality check failed")
+_QUALITY_PATTERNS = ("judge", "quality check failed", "score below")
 
 
 def classify(log_text: str) -> FailureKind:
     """基于日志关键词分类。无法判定时按 ENGINE 处理（重试成本低于误拉黑）。"""
-    raise NotImplementedError
+    text = (log_text or "").lower()
+    if any(kw in text for kw in _QUALITY_PATTERNS):
+        return FailureKind.QUALITY
+    return FailureKind.ENGINE
 
 
 def next_config(record: TaskRecord) -> str | None:
