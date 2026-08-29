@@ -16,8 +16,10 @@ def classify(log_text: str) -> FailureKind:
     raise NotImplementedError
 
 
-def next_config(record: TaskRecord) -> dict | None:
-    """引擎失败的调参序列：降精度 → 降并行 → 换框架，按 retry_count 递进；
+def next_config(record: TaskRecord) -> str | None:
+    """引擎失败的调参序列：解析 record.config_params（YAML，spec 附录 A.1.1），
+    按 retry_count 递进调整——降 gpu-memory-utilization / 降 max_model_len /
+    调 tp_size（sut 与 ref 保持一致）→ 换框架——重渲染为 YAML 字符串返回；
     序列耗尽返回 None（调用方拉黑）。"""
     raise NotImplementedError
 
@@ -27,6 +29,6 @@ def handle(storage: Storage, client: PlatformClient, settings: Settings) -> None
 
     - ENGINE：next_config 调参后重新入队，retry_count+1；≥max_retries → BLACKLISTED；
     - QUALITY：NEEDS_HUMAN + 黑名单，不自动重试；
-    - TIMEOUT：stop_task 释放资源；悬赏未过期可重排队一次，否则 ABANDONED。
+    - TIMEOUT：stop_tasks 批量释放资源；悬赏未过期可重排队一次，否则 ABANDONED。
     """
     raise NotImplementedError

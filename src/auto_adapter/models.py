@@ -59,8 +59,8 @@ class TaskRecord:
     framework: str
     status: TaskStatus
     priority: Priority
-    config_params: dict = field(default_factory=dict)
-    task_id: str | None = None
+    config_params: str = ""  # YAML 字符串（spec 附录 A.1.1），重试时解析调整后重渲染
+    task_id: int | None = None  # 平台 AsyncTaskVO.id，int64
     retry_count: int = 0
     submit_time: datetime | None = None
     bounty_deadline: datetime | None = None
@@ -69,11 +69,25 @@ class TaskRecord:
 
 @dataclass(frozen=True)
 class AddTaskRequest:
-    """POST /api/adapt/task/add 请求体。字段名以平台 OpenAPI 为准（spec §9）。"""
+    """POST /api/adapt/task/add 请求体（spec 附录 A.1）。
+
+    序列化为 JSON 时字段名转 camelCase：modelAddress/taskType/targetGpu/
+    framework/configParams/strategyId。
+    """
 
     model_address: str
     task_type: str
     target_gpu: str
     framework: str
-    config_params: dict
+    config_params: str  # YAML 字符串，含 sut_config/ref_config（附录 A.1.1）
     strategy_id: str
+
+
+@dataclass(frozen=True)
+class ModelSearchResult:
+    """GET search-by-model-id 响应 data（spec 附录 A.4）。"""
+
+    is_in_db: bool
+    model_info: dict
+    # 按 GPU 型号分键的验证结果——eligibility 分类的直接依据
+    verify_result: dict[str, dict]

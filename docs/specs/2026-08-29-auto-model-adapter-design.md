@@ -55,7 +55,7 @@ main.py (entrypoint)
 ### TaskRecord（本地任务表，持久化）
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| task_id | str \| None | 平台返回；提交前为 None |
+| task_id | int \| None | 平台返回（int64）；提交前为 None |
 | model_id | str | |
 | target_gpu | str | |
 | framework | str | |
@@ -64,7 +64,7 @@ main.py (entrypoint)
 | retry_count | int | |
 | submit_time | datetime \| None | |
 | bounty_deadline | datetime \| None | |
-| config_params | dict | 实际提交的 configParams，重试时在此基础上调整 |
+| config_params | str | 实际提交的 configParams（YAML 字符串，附录 A.1.1），重试时解析调整后重渲染 |
 
 ### 状态机（TaskStatus）
 
@@ -88,15 +88,18 @@ QUEUED ──submit──▶ PENDING ──▶ RUNNING ──▶ SUCCESS
 
 | 方法 | 对应 API |
 |---|---|
-| `add_task(req: AddTaskRequest) -> str`（返回 task_id） | `POST /api/adapt/task/add` |
-| `list_tasks(page, size) -> list[PlatformTask]` | `GET /api/adapt/task/page` |
-| `get_task_log(task_id) -> str` | `GET /api/adapt/task/log?taskId=` |
-| `search_adaptations(model_id) -> list[AdaptationRecord]` | `GET /api/computility/models/search-by-model-id` |
-| `stop_task(task_id)` | `PUT /api/async/task/stop-create-contest-task` |
-| `list_bounties() -> list[BountyItem]` | 悬赏列表接口（TODO：确认真实路径后补齐） |
+| `add_task(req: AddTaskRequest) -> int`（返回平台任务 id，int64） | `POST /api/adapt/task/add` |
+| `list_my_tasks(current, page_size, **filters) -> Page`（固定 `onlyMine=true`） | `GET /api/adapt/task/page` |
+| `get_task_log(task_id: int) -> str` | `GET /api/adapt/task/log?taskId=` |
+| `search_model(model_id) -> ModelSearchResult` | `GET /api/computility/models/search-by-model-id?modelId=` |
+| `stop_tasks(task_ids: list[int]) -> bool`（批量） | `PUT /api/async/task/stop-create-contest-task` |
+| `list_bounties() -> list[BountyItem]` | 悬赏列表接口（开放平台 API 文档中无此接口，见 §9） |
 
-错误处理：4xx 抛 `PlatformClientError`（不重试）；5xx/网络错误由调用方
-按 tick 自然重试（本 tick 失败记日志跳过，不做进程内指数退避——下个 tick 就是退避）。
+所有响应为统一信封 `{code, message, data}`，`code == 0` 为成功；非 0 按错误码表
+（附录 A.6）分类：40100/40101 为凭据问题（告警并打开 kill_switch），40400 视为资源
+不存在（业务分支处理），50000/50001 按临时错误由下个 tick 自然重试。
+网络错误/超时同样记日志跳过，不做进程内指数退避——下个 tick 就是退避。
+精确请求/响应 schema 见附录 A（抓取自平台在线 API 文档，2026-08-29）。
 
 ### 4.2 `discovery/` — 模型发现层
 - `base.py`：`class DiscoverySource(Protocol): def fetch(self) -> list[CandidateModel]`
@@ -197,6 +200,129 @@ QUEUED ──submit──▶ PENDING ──▶ RUNNING ──▶ SUCCESS
 每个里程碑遵循 TDD：先写该模块契约测试，再实现。
 
 ## 9. 开放问题（实现前需向用户确认）
-- 悬赏列表的真实 API 路径与响应结构（文档未给出，`list_bounties` 暂为占位）；
-- `POST /api/adapt/task/add` 的精确请求/响应 schema（字段名以平台 OpenAPI 为准，实现 M2 前需拿到）;
-- 平台支持的 framework 枚举与 GPU 型号枚举列表。
+- ~~`POST /api/adapt/task/add` 的精确 schema~~ → 已确认，见附录 A（2026-08-29 抓取自在线文档）；
+- 悬赏列表：开放平台 API 文档确认**没有**悬赏接口——悬赏来源需改为爬取
+  「模型适配挑战」页面或人工配置列表（BountySource 实现方式待定）；
+- framework 与 targetGpu 的合法枚举列表文档未给出（样例仅见 `vllm`、`MetaX_c-500`），
+  需从平台页面或试探确认；
+- `status` / `stage` / `verifyResult` 的枚举取值文档未给出，M5 实现前需用真实任务观察确认。
+
+---
+
+## 附录 A：平台 API 契约（抓取自 https://modelhub.org.cn/other/api.html，2026-08-29）
+
+统一约定：请求头 `Xc-Token`；响应信封 `{code: int32, message: str, data: T}`，`code == 0` 成功。
+
+### A.1 POST /api/adapt/task/add — 创建验证任务
+
+请求体（全部必填；**注意 `configParams` 是 YAML 字符串，不是 JSON 对象**）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| modelAddress | string | 模型仓库或模型文件地址 |
+| taskType | string | 如 `text-generation` |
+| targetGpu | string | 如 `MetaX_c-500` |
+| framework | string | 如 `vllm` |
+| strategyId | string | 验证策略 ID（UUID） |
+| configParams | string | YAML 配置内容，结构见 A.1.1 |
+
+响应 `data: AsyncTaskVO`：`{id: int64, name: str, status: str, createTime, updateTime}` —— **任务 id 是 int64**。
+
+#### A.1.1 configParams YAML 结构（官方样例）
+
+```yaml
+framework: vllm
+api: completion        # completion | (其他待确认)
+lang: en
+max_model_len: 4096
+max_tokens: 1024
+temperature: 0.7
+repetition_penalty: 1.1
+top_p: 0.9
+sut_config:            # 被测系统（目标国产 GPU）启动配置
+  gpu_num: 1
+  values:
+    command:
+    - /opt/conda/bin/vllm
+    - serve
+    - /model
+    - --port
+    - '20644'
+    - --served-model-name
+    - llm
+    - --max-model-len
+    - '4096'
+    - --gpu-memory-utilization
+    - '0.9'
+    - -tp
+    - '1'
+    - --enforce-eager
+    - --trust-remote-code
+ref_config:            # 参照系统启动配置（对照评测用）
+  gpu_num: 1
+  values:
+    command:
+    - vllm
+    - serve
+    - /model
+    - --port
+    - '80'
+    - --served-model-name
+    - llm
+    - --max-model-len
+    - '4096'
+    - -tp
+    - '1'
+    - --enforce-eager
+    - --trust-remote-code
+```
+
+调参含义：引擎失败重试时可调整 `gpu_num`/`-tp`（并行度）、`--gpu-memory-utilization`、
+`max_model_len`（显存）等；`sut_config` 与 `ref_config` 的 `-tp`/`gpu_num` 需保持一致调整。
+
+### A.2 GET /api/adapt/task/log — 获取任务日志
+
+Query：`taskId: int64`（必填）。响应 `data: string`（日志全文）。
+
+### A.3 GET /api/adapt/task/page — 获取验证任务列表
+
+Query（全部可选）：`current`、`pageSize`（int64 分页）、`onlyMine: bool`（**对账时固定 true**）、
+`modelId`、`gpuType`、`taskId`、`taskType`、`status`、`stage`、`verifyResult: int32`、
+`searchText`、`creatorId`、`beginTime`、`endTime`（date-time）。
+
+响应 `data: Page<AsyncModelVerifyTaskVO>`：`{current, pages, size, total, records[], ...}`，
+`records[]` 关键字段：
+
+| 字段 | 类型 | 用途 |
+|---|---|---|
+| taskId | int64 | 对账主键 |
+| modelId | string | |
+| gpuType | string | |
+| status / statusText | string | 任务状态（枚举待确认） |
+| verifyResult / verifyResultText | int32 / string | 验证结果（枚举待确认） |
+| updateTime | date-time | 超时判定依据 |
+| machineId/machineName, manufacturerId/manufacturerName, creatorId, userAccount, contributors[], modelTaskLevel(Id), modelAuthorName, userProfile | — | 本系统暂不使用 |
+
+### A.4 GET /api/computility/models/search-by-model-id — 模型详情（去重依据）
+
+Query：`modelId: string`（必填）。响应 `data: ModelSearchResultVO`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| isInDB | boolean | 模型是否已入库 |
+| modelInfo | ModelBasicInfo | `{modelId, modelName, authorName, source, createTime}` |
+| verifyResult | **Map<string, GpuVerifyResult>** | **按 GPU 型号分键的验证结果**——eligibility 分类的直接依据：无键=新模型；无当前目标 GPU 的键=新适配；有键且已通过=完全重复跳过（GpuVerifyResult 内部字段待实测确认） |
+
+### A.5 PUT /api/async/task/stop-create-contest-task — 终止验证任务
+
+请求体：`{"taskIds": [int64, ...]}`（**批量**）。响应 `data: boolean`。
+
+### A.6 统一错误码
+
+| code | 名称 | 含义 | 本系统处理 |
+|---|---|---|---|
+| 40100 | NOT_LOGIN_ERROR | 未登录/登录态失效 | 凭据告警 + kill_switch |
+| 40101 | NO_AUTH_ERROR | 无权限 | 凭据告警 + kill_switch |
+| 40400 | NOT_FOUND_ERROR | 资源不存在 | 按业务分支处理（如查无模型） |
+| 50000 | SYSTEM_ERROR | 系统内部异常 | 记日志，下个 tick 重试 |
+| 50001 | OPERATION_ERROR | 操作执行失败 | 记日志，检查参数后重试 |

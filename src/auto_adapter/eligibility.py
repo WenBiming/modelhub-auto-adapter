@@ -35,10 +35,11 @@ def evaluate(
     """分类矩阵（spec §4.3）：
 
     - 本地已有活跃/成功/拉黑记录        → SKIP_DUPLICATE
-    - 平台无记录                        → ENQUEUE, NEW_MODEL
-    - 平台有记录但目标 GPU 不同          → ENQUEUE, NEW_ADAPTATION
-    - 平台同模型同 GPU 已适配            → SKIP_DUPLICATE
+    平台侧依据 client.search_model().verify_result（按 GPU 型号分键，spec 附录 A.4）：
+    - verify_result 无任何键             → ENQUEUE, NEW_MODEL
+    - 有键但无当前 target_gpu 的键       → ENQUEUE, NEW_ADAPTATION
+    - 有 target_gpu 的键且已通过         → SKIP_DUPLICATE
     - 候选命中悬赏                      → ENQUEUE, BOUNTY（覆盖上面的优先级）
-    - search_adaptations 抛异常          → SKIP_UNCERTAIN
+    - search_model 抛异常/网络失败       → SKIP_UNCERTAIN（宁漏勿重）
     """
     raise NotImplementedError

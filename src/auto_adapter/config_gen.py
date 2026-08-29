@@ -26,8 +26,14 @@ def resolve_tp_size(params_size: str | None) -> int:
     raise NotImplementedError
 
 
+def render_config_params(framework: str, tp_size: int, max_model_len: int = 4096,
+                         gpu_mem_util: float = 0.9) -> str:
+    """渲染 templates/{framework}.yaml 为 configParams YAML 字符串（spec 附录 A.1.1）。"""
+    raise NotImplementedError
+
+
 def build_request(
     candidate: CandidateModel, target_gpu: str, strategy_id: str
 ) -> AddTaskRequest:
-    """组装完整请求体：templates/ 模板 + 上述推导结果。"""
+    """组装完整请求体：上述推导结果 + render_config_params。"""
     raise NotImplementedError
