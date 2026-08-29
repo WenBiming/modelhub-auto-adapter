@@ -21,12 +21,15 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        tick_seconds = int(os.environ.get("TICK_SECONDS", cls.tick_seconds))
+        if tick_seconds < 60:
+            raise ValueError("TICK_SECONDS must be >= 60 (rate limit assumes one drain per minute)")
         return cls(
             xc_token=os.environ["XC_TOKEN"],
             strategy_id=os.environ["STRATEGY_ID"],
             base_url=os.environ["MODELHUB_BASE_URL"],
             storage_path=os.environ.get("STORAGE_PATH", cls.storage_path),
-            tick_seconds=int(os.environ.get("TICK_SECONDS", cls.tick_seconds)),
+            tick_seconds=tick_seconds,
             max_submits_per_minute=int(
                 os.environ.get("MAX_SUBMITS_PER_MINUTE", cls.max_submits_per_minute)
             ),
