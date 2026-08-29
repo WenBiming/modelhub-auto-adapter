@@ -141,3 +141,45 @@ def test_expiring_bounty_abandoned_regardless_of_budget(store):
     abandoned = store.tasks_by_status(TaskStatus.ABANDONED)
     assert len(abandoned) == 1
     assert abandoned[0].model_id == "org/expiring"
+
+
+def test_task_id_persist_failure_stops_submissions(store):
+    """Safety property ROUND 2: When update_task fails after successful submission
+    (persisting task_id), drain must immediately stop and return, not continue to
+    submit more records in the same tick. This prevents cascading failures when
+    storage is unreliable."""
+    store.insert_task(_queued("org/first"))
+    store.insert_task(_queued("org/second"))
+
+    client = Mock()
+    client.add_task.side_effect = [111, 222]  # Would succeed for both if we got that far
+
+    original_update = store.update_task
+    call_count = [0]
+    def failing_update(rec):
+        call_count[0] += 1
+        if call_count[0] == 2:  # Second call: persisting task_id for first record
+            raise RuntimeError("storage unreliable")
+        return original_update(rec)
+
+    store.update_task = failing_update
+
+    # Should submit first record and return, never submit second
+    result = submitter.drain(store, client, SETTINGS, now=NOW)
+    assert result == 1
+
+    # Kill switch must be on (storage failed)
+    assert store.kill_switch() is True
+
+    # client.add_task called only once (second record never submitted)
+    assert client.add_task.call_count == 1
+
+    # First record is PENDING (submitted successfully)
+    pending = store.tasks_by_status(TaskStatus.PENDING)
+    assert len(pending) == 1
+    assert pending[0].model_id == "org/first"
+
+    # Second record still QUEUED (never submitted)
+    queued = store.tasks_by_status(TaskStatus.QUEUED)
+    assert len(queued) == 1
+    assert queued[0].model_id == "org/second"

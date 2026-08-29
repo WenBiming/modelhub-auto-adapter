@@ -21,7 +21,7 @@ def drain(storage: Storage, client: PlatformClient, settings: Settings, now: dat
     """提交 QUEUED 任务，返回本 tick 实际提交数。
 
     - kill_switch 打开时直接返回 0；
-    - 排序键 (priority, bounty_deadline, discovered_at)；
+    - 排序键 (priority, bounty_deadline, model_id)；
     - 令牌桶：max_submits_per_minute；在途 (PENDING+RUNNING) ≥ max_inflight 时停止；
     - 悬赏剩余时间 < 预估适配时长×2 仍未提交 → 标记 ABANDONED 并告警；
     - 成功：写回 task_id/submit_time/status=PENDING；失败：保持 QUEUED 记录原因。
@@ -113,6 +113,9 @@ def drain(storage: Storage, client: PlatformClient, settings: Settings, now: dat
             logger.error("failed to persist task_id %d for %s (MANUAL RECONCILIATION REQUIRED)",
                         record.task_id, record.model_id)
             storage.set_kill_switch(True, f"update_task failed for {record.model_id} with task_id {record.task_id}")
+            # Storage is unreliable; stop all submissions in this tick
+            submitted += 1
+            return submitted
 
         submitted += 1
     return submitted
