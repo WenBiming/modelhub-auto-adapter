@@ -5,7 +5,8 @@
 
 Task 10（M6）：接线全链路——discovery.run → eligibility.evaluate（逐候选）→
 config_gen.build_request + storage.insert_task → submitter.drain → monitor.poll →
-failure.handle，步骤间检查 stop_event，metrics 逐项计数并在 tick 末尾 flush。
+failure.handle，五个步骤边界均检查 stop_event（候选循环内、drain 前、poll 前、
+handle 前），metrics 逐项计数，tick 末尾 flush 后清零（逐 tick 而非累计值）。
 """
 from __future__ import annotations
 
@@ -84,10 +85,10 @@ def tick(deps: Deps, stop_event: threading.Event) -> None:
     """
     s = deps
     metrics.incr("candidates_discovered", discovery.run(s.sources, s.storage))
+    target_gpu = config_gen.select_target_gpu(s.storage)  # 覆盖率缓存 loop 内不变，提前一次读取
     for cand in s.storage.pending_candidates():
         if stop_event.is_set():
             return
-        target_gpu = config_gen.select_target_gpu(s.storage)
         decision = eligibility.evaluate(cand, target_gpu, s.storage, s.client)
         if decision.verdict == Verdict.SKIP_UNCERTAIN:
             metrics.incr("skipped_uncertain")
@@ -116,8 +117,11 @@ def tick(deps: Deps, stop_event: threading.Event) -> None:
     if stop_event.is_set():
         return
     monitor.poll(s.storage, s.client, s.settings)
+    if stop_event.is_set():
+        return
     failure.handle(s.storage, s.client, s.settings)
     metrics.flush_tick_summary()
+    metrics.reset()  # 逐 tick 计数：flush 后清零，日志流每行反映"这一 tick"而非累计值
 
 
 if __name__ == "__main__":
