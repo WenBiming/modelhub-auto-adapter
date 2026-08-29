@@ -43,7 +43,18 @@ def next_config(record: TaskRecord) -> str | None:
     """引擎失败的调参序列：解析 record.config_params（YAML，spec 附录 A.1.1），
     按 retry_count 递进调整——0: gpu-memory-utilization 提至 0.95；
     1: max_model_len 减半（下限 2048）；2: tp 翻倍（上限 4，sut 与 ref 保持一致）；
-    ≥3: 序列耗尽返回 None（调用方拉黑）。"""
+    ≥3: 序列耗尽返回 None（调用方拉黑）。
+
+    每一档都基于 record.config_params 当前值累加调整（调用方在重试后把返回值写回
+    record.config_params，故各档修改会在后续重试中保留）。
+
+    顶层 max_model_len 与 sut_config/ref_config.gpu_num 按平台样例（spec 附录 A.1.1）
+    是无引号整数；command 列表里的 --max-model-len/-tp 参数值是平台 CLI 参数，须保持
+    字符串。
+
+    tp 档（retry_count==2）若翻倍后与当前值相同（已达 _MAX_TP 上限，如 72B 模型起始
+    tp=4），说明这一档不能真正改变配置——重新提交同一份已失败过的配置只会触发平台的
+    重复提交监控，因此视为序列耗尽，返回 None（调用方拉黑）。"""
     cfg = yaml.safe_load(record.config_params)
     sut = cfg["sut_config"]["values"]["command"]
     ref = cfg["ref_config"]["values"]["command"]
@@ -57,9 +68,11 @@ def next_config(record: TaskRecord) -> str | None:
     elif record.retry_count == 2:
         current = int(sut[sut.index("-tp") + 1]) if "-tp" in sut else 1
         new_tp = min(current * 2, _MAX_TP)
+        if new_tp == current:
+            return None  # 已达上限，翻倍无效——不重复提交同一份失败配置
         for section, cmd in (("sut_config", sut), ("ref_config", ref)):
             _set_flag(cmd, "-tp", str(new_tp))
-            cfg[section]["gpu_num"] = str(new_tp)
+            cfg[section]["gpu_num"] = new_tp
     else:
         return None
     return yaml.safe_dump(cfg, sort_keys=False)

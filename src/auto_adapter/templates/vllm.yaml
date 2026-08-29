@@ -5,13 +5,13 @@
 framework: vllm
 api: completion
 lang: en
-max_model_len: "{max_model_len}"
+max_model_len: {max_model_len}
 max_tokens: 1024
 temperature: 0.7
 repetition_penalty: 1.1
 top_p: 0.9
 sut_config:
-  gpu_num: "{tp_size}"
+  gpu_num: {tp_size}
   values:
     command:
       - /opt/conda/bin/vllm
@@ -30,7 +30,7 @@ sut_config:
       - --enforce-eager
       - --trust-remote-code
 ref_config:
-  gpu_num: "{tp_size}"
+  gpu_num: {tp_size}
   values:
     command:
       - vllm

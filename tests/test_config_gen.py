@@ -35,7 +35,8 @@ def test_render_config_params_is_valid_yaml_with_consistent_tp():
     ref_cmd = cfg["ref_config"]["values"]["command"]
     assert sut_cmd[sut_cmd.index("-tp") + 1] == "2"
     assert ref_cmd[ref_cmd.index("-tp") + 1] == "2"
-    assert cfg["sut_config"]["gpu_num"] == "2"
+    assert cfg["sut_config"]["gpu_num"] == 2
+    assert cfg["max_model_len"] == 2048
 
 
 def test_render_config_params_transformers_template():
@@ -46,7 +47,8 @@ def test_render_config_params_transformers_template():
     ref_cmd = cfg["ref_config"]["values"]["command"]
     assert sut_cmd[sut_cmd.index("-tp") + 1] == "4"
     assert ref_cmd[ref_cmd.index("-tp") + 1] == "4"
-    assert cfg["sut_config"]["gpu_num"] == "4"
+    assert cfg["sut_config"]["gpu_num"] == 4
+    assert cfg["max_model_len"] == 8192
 
 
 def test_select_target_gpu_prefers_lowest_coverage(tmp_path):
