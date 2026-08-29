@@ -34,12 +34,12 @@ def evaluate(
 ) -> Decision:
     """分类矩阵（spec §4.3）：
 
-    - 本地已有活跃/成功/拉黑记录        → SKIP_DUPLICATE
+    - 任一已存在记录，不限状态             → SKIP_DUPLICATE（不查平台）
     平台侧依据 client.search_model().verify_result（按 GPU 型号分键，spec 附录 A.4）：
     - verify_result 无任何键             → ENQUEUE, NEW_MODEL
     - 有键但无当前 target_gpu 的键       → ENQUEUE, NEW_ADAPTATION
     - 有 target_gpu 的键且已通过         → SKIP_DUPLICATE
-    - 候选命中悬赏                      → ENQUEUE, BOUNTY（覆盖上面的优先级）
+    - 候选命中悬赏                      → ENQUEUE, BOUNTY（不覆盖 SKIP_DUPLICATE）
     - search_model 抛异常/网络失败       → SKIP_UNCERTAIN（宁漏勿重）
     """
     if storage.get_task(candidate.model_id, target_gpu) is not None:

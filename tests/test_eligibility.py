@@ -56,6 +56,12 @@ def test_bounty_gets_top_priority(store, candidate):
     assert d.verdict == Verdict.ENQUEUE and d.priority == Priority.BOUNTY
 
 
+def test_bounty_does_not_override_duplicate(store, candidate):
+    c = replace(candidate, is_bounty=True)
+    d = evaluate(c, GPU, store, _client({GPU: {"passed": True}}))
+    assert d.verdict == Verdict.SKIP_DUPLICATE
+
+
 def test_platform_error_skips_conservatively(store, candidate):
     d = evaluate(candidate, GPU, store, _client(error=True))
     assert d.verdict == Verdict.SKIP_UNCERTAIN
