@@ -228,3 +228,83 @@ def test_metrics_line_reports_kill_switch_state_and_reason(tmp_path, capsys):
     line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert line["kill_switch"]["on"] is True
     assert "vanished" in line["kill_switch"]["reason"]
+
+
+def test_persistently_uncertain_candidate_stops_blocking_the_queue(tmp_path, candidate):
+    """Re-review ITEM 2: SKIP_UNCERTAIN candidates are never marked processed, and the
+    per-tick cap slices a stable `WHERE processed = 0` scan. A full slice of candidates the
+    platform never answers for would occupy that slice forever, starving everything behind
+    them permanently while the agent still looks healthy.
+
+    After MAX_UNCERTAIN_TICKS consecutive uncertain ticks the candidate is escalated to
+    NEEDS_HUMAN and marked processed, so the queue advances — and because a task record now
+    exists for the pair, a later evaluation short-circuits to SKIP_DUPLICATE rather than
+    turning the release into a blind submission."""
+    from dataclasses import replace
+
+    from auto_adapter import main as main_module
+    from auto_adapter.platform_client import PlatformClientError
+
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    client = Mock()
+    client.add_task.return_value = 501
+    # the listing carries the task that "org/behind" will create, so reconciliation in the
+    # same tick is coherent (an empty listing would read as a vanished task)
+    client.list_my_tasks.return_value = {"records": [
+        {"taskId": 501, "status": "RUNNING", "modelId": "org/behind", "gpuType": "MetaX_c-500"}]}
+
+    blockers = [replace(candidate, model_id=f"org/blocker{i}")
+                for i in range(main_module.MAX_CANDIDATES_PER_TICK)]
+    behind = replace(candidate, model_id="org/behind")
+
+    def search_model(model_id):
+        if model_id.startswith("org/blocker"):
+            raise PlatformClientError(50000, "system error")  # persistently unanswerable
+        return ModelSearchResult(False, {}, {})
+
+    client.search_model.side_effect = search_model
+    deps = _deps(storage, client, [_src(blockers + [behind])])
+
+    # Ticks 1..MAX-1: the blockers fill the slice and "org/behind" is never reached.
+    for _ in range(main_module.MAX_UNCERTAIN_TICKS - 1):
+        tick(deps, threading.Event())
+    assert storage.get_task("org/behind", "MetaX_c-500") is None
+    assert any(c.model_id == "org/behind" for c in storage.pending_candidates())
+
+    # The escalating tick releases the whole slice...
+    tick(deps, threading.Event())
+    for blocker in blockers:
+        rec = storage.get_task(blocker.model_id, "MetaX_c-500")
+        assert rec is not None and rec.status == TaskStatus.NEEDS_HUMAN
+        assert rec.model_url == blocker.model_url
+
+    # ...and the candidate behind them is evaluated and enqueued on the next tick.
+    tick(deps, threading.Event())
+    rec = storage.get_task("org/behind", "MetaX_c-500")
+    assert rec is not None and rec.status not in (TaskStatus.NEEDS_HUMAN, TaskStatus.ABANDONED)
+    assert client.add_task.call_args.args[0].model_address == behind.model_url
+
+
+def test_uncertain_streak_resets_when_the_platform_answers(tmp_path, candidate):
+    """The escalation counts CONSECUTIVE failures: a candidate that is merely flaky must
+    never be escalated, or a transient outage would dump the whole queue on a human."""
+    from auto_adapter import main as main_module
+    from auto_adapter.platform_client import PlatformClientError
+
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    client = Mock()
+    client.list_my_tasks.return_value = {"records": []}
+    client.add_task.return_value = 502
+    deps = _deps(storage, client, [_src([candidate])])
+
+    client.search_model.side_effect = PlatformClientError(50000, "system error")
+    for _ in range(main_module.MAX_UNCERTAIN_TICKS - 1):
+        tick(deps, threading.Event())
+
+    client.search_model.side_effect = None
+    client.search_model.return_value = ModelSearchResult(False, {}, {})
+    tick(deps, threading.Event())  # answered: streak resets, candidate enqueued normally
+
+    assert storage.get_counter(main_module._uncertain_key(candidate.model_id)) == 0
+    rec = storage.get_task(candidate.model_id, "MetaX_c-500")
+    assert rec is not None and rec.status != TaskStatus.NEEDS_HUMAN

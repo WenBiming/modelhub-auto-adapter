@@ -127,9 +127,10 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
     - list_my_tasks（onlyMine=true）分页拉取账号全部任务历史（非仅在途任务），以平台
       status/verifyResult 为准更新 TaskRecord；分页读取见 `_fetch_platform_rows`——
       "消失"判定只在完整读完所有页时才成立，避免把"还没翻到的页"误判为任务丢失；
-    - 本地记录 task_id 为 None（PENDING 意图已落盘但 add_task 结果不可知）→ 先按
-      (modelId, gpuType) 在平台列表里认领回 task_id、恢复正常对账；只有枚举完整且
-      确实无匹配行时才标 NEEDS_HUMAN；枚举不完整就原样留到下个 tick；
+    - 本地记录 task_id 为 None（PENDING 意图已落盘但 add_task 结果不可知）→ **仅在枚举
+      完整时**按 (modelId, gpuType) 认领回 task_id 恢复正常对账，无匹配行才标
+      NEEDS_HUMAN；枚举不完整（truncated/failed）时认领和判死都不做，原样留到下个
+      tick——部分列表里的"最新一行"可能只是历史旧行，认错了会引出重复提交；
     - 本地在途但平台侧（完整枚举后）消失的任务 → ABANDONED + set_kill_switch(True)
       （可能被违规清理，最高级别告警，暂停提交待人工确认）；
     - 失败任务拉日志存入 record.last_log，留给 failure 层分类；日志拉取失败时**不**
@@ -160,6 +161,16 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
     enumeration_complete = outcome == "complete"
 
     for rec in orphans:
+        if not enumeration_complete:
+            # 认领和判死一样，必须建立在完整枚举之上。list_my_tasks 是账号**全部历史**，
+            # 同一 (modelId, gpuType) 走过重试梯子/悬赏重排队后会留下多条旧行；部分枚举
+            # 里"taskId 最大的一行"完全可能只是一条陈旧的 FAILED 行，而真正新建的那条还
+            # 在没翻到的页上。认领到旧行 → 状态被同步成 engine_failed → failure.handle
+            # 重新入队 → 下一轮 drain 为同一对提交第二个任务，而第一个可能仍在平台上跑。
+            logger.warning(
+                "task record for model %s has no task_id; platform enumeration was %s, "
+                "leaving it untouched for the next tick", rec.model_id, outcome)
+            continue
         row = _match_orphan(rec, platform_rows)
         if row is not None:
             rec.task_id = int(row["taskId"])
@@ -169,16 +180,12 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
                 "unknown; the platform did create it)",
                 rec.model_id, rec.target_gpu, rec.task_id)
             records.append(rec)
-        elif enumeration_complete:
+        else:
             rec.status = TaskStatus.NEEDS_HUMAN
             storage.update_task(rec)
             logger.warning(
                 "task record for model %s has no task_id and no matching platform row "
                 "(enumeration complete); marked NEEDS_HUMAN", rec.model_id)
-        else:
-            logger.warning(
-                "task record for model %s has no task_id; platform enumeration was %s, "
-                "leaving it untouched for the next tick", rec.model_id, outcome)
 
     if not records:
         return

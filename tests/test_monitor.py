@@ -309,3 +309,48 @@ def test_credential_error_during_poll_trips_kill_switch(store):
     monitor.poll(store, client, SETTINGS, now=NOW)
 
     assert store.kill_switch() is True
+
+
+def test_orphan_not_reattached_to_stale_row_on_partial_enumeration(store):
+    """I5 re-review: reattaching must be gated on a COMPLETE enumeration, exactly like the
+    NEEDS_HUMAN escalation.
+
+    list_my_tasks is the account's full task history, so a pair that has been through the
+    retry ladder or a bounty requeue has stale rows. Reproduced chain when the gate is
+    missing: an ambiguous submit leaves PENDING/task_id=None; next tick page 1 returns an
+    old FAILED row for the same (modelId, gpuType) while page 2 — which carries the newly
+    created task — errors; the orphan reattaches to the stale taskId, monitor marks it
+    engine_failed, failure.handle requeues it, and the next drain submits a SECOND task for
+    that pair while the first may still be live on the platform."""
+    store.insert_task(_pending("org/a", None))
+    client = Mock()
+
+    def list_my_tasks(current=1, page_size=50, **filters):
+        if current == 1:
+            # stale historical row for the very same (modelId, gpuType)
+            return {"records": [_row(11, "FAILED", model_id="org/a")],
+                    "total": 2, "current": 1, "pages": 2, "size": 100}
+        raise ConnectionError("page 2 down")  # the page holding the real new task
+
+    client.list_my_tasks.side_effect = list_my_tasks
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.task_id is None, "must not adopt a taskId from an incomplete listing"
+    assert rec.status == TaskStatus.PENDING  # not engine_failed, so nothing requeues it
+    client.get_task_log.assert_not_called()
+
+
+def test_orphan_not_reattached_to_stale_row_on_truncated_enumeration(store):
+    """Same gate for the MAX_PAGES/stop_event truncation outcome."""
+    store.insert_task(_pending("org/a", None))
+    client = Mock()
+    client.list_my_tasks.side_effect = lambda current=1, page_size=50, **f: {
+        "records": [_row(9000 + current, "FAILED", model_id="org/a")],
+        "total": 999, "current": current, "pages": 999, "size": 100}
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.task_id is None and rec.status == TaskStatus.PENDING

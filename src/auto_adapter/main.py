@@ -21,7 +21,7 @@ from .discovery import base as discovery
 from .discovery.bounty import ManualBountySource
 from .discovery.huggingface import HuggingFaceSource
 from .eligibility import Verdict
-from .models import TaskRecord, TaskStatus
+from .models import Priority, TaskRecord, TaskStatus
 from .platform_client import PlatformClient
 from .settings import Settings
 from .storage import SqliteStorage
@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 # 候选表可能一次涌入几百条（一次 HF 拉取 50 条 × 多个 tick 累积）。超出的部分不标
 # processed，留到下个 tick，顺序不变。
 MAX_CANDIDATES_PER_TICK = 20
+
+# 同一候选连续多少个 tick 拿不到平台结果后升级为 NEEDS_HUMAN 并放行队列。
+# 与上面的切片配套：SKIP_UNCERTAIN 不标 processed，若干个"永远查不出结果"的候选
+# 会占满切片、把后面的候选无限期饿死（见 _note_uncertain）。
+MAX_UNCERTAIN_TICKS = 5
 
 
 def run_loop(tick_fn, stop_event: threading.Event, interval_seconds: float) -> None:
@@ -120,7 +125,9 @@ def _tick_body(s: Deps, stop_event: threading.Event) -> None:
         decision = eligibility.evaluate(cand, target_gpu, s.storage, s.client)
         if decision.verdict == Verdict.SKIP_UNCERTAIN:
             metrics.incr("skipped_uncertain")
-            continue  # 不标记 processed，下个 tick 重试
+            _note_uncertain(s, cand, target_gpu)
+            continue  # （未到上限时）不标记 processed，下个 tick 重试
+        _clear_uncertain(s, cand)
         if decision.verdict == Verdict.ENQUEUE:
             try:
                 req = config_gen.build_request(cand, target_gpu, s.settings.strategy_id)
@@ -161,15 +168,58 @@ def _insert_needs_human(s: Deps, cand, target_gpu: str, decision,
     """
     metrics.incr(error.reason)
     logger.warning("%s: %s", error.reason, error)
+    _needs_human_record(s, cand, target_gpu, decision.priority, error.framework)
+
+
+def _needs_human_record(s: Deps, cand, target_gpu: str, priority, framework: str = "") -> None:
     try:
         s.storage.insert_task(TaskRecord(
             model_id=cand.model_id, target_gpu=target_gpu,
-            framework=error.framework, status=TaskStatus.NEEDS_HUMAN,
-            priority=decision.priority, model_url=cand.model_url,
+            framework=framework, status=TaskStatus.NEEDS_HUMAN,
+            priority=priority, model_url=cand.model_url,
             task_type="", config_params="",
             bounty_deadline=cand.bounty_deadline))
     except DuplicateTaskError:
         pass  # 已有记录（含之前落的 NEEDS_HUMAN），无须重复插入
+
+
+def _uncertain_key(model_id: str) -> str:
+    return f"uncertain:{model_id}"
+
+
+def _note_uncertain(s: Deps, cand, target_gpu: str) -> None:
+    """记一次"平台查不出结果"，连续 MAX_UNCERTAIN_TICKS 次后放行队列。
+
+    SKIP_UNCERTAIN 的候选不标 processed（宁漏勿重：查不清就不提交），但候选循环每个
+    tick 只取前 MAX_CANDIDATES_PER_TICK 条、且 `WHERE processed = 0` 的扫描顺序稳定：
+    只要有 20 个候选持续查不出结果，它们就会永远占满整个切片，后面所有候选被无限期
+    饿死，而进程看起来一切正常（/health 200、tick 不报错）。
+
+    连续 5 个 tick 都问不出结果，说明平台对这个模型持续不作答——那是人的问题，不是
+    值得无限重试的问题：落 NEEDS_HUMAN 记录并标记 processed 让队列前进。记录本身也
+    保证了后续 eligibility 对同一 (model_id, target_gpu) 直接 SKIP_DUPLICATE，不会
+    因为放行而变成一次盲提交。
+    """
+    key = _uncertain_key(cand.model_id)
+    streak = s.storage.get_counter(key) + 1
+    s.storage.set_counter(key, streak)
+    if streak < MAX_UNCERTAIN_TICKS:
+        return
+    priority = Priority.BOUNTY if cand.is_bounty else Priority.NEW_MODEL
+    _needs_human_record(s, cand, target_gpu, priority)
+    s.storage.mark_candidate_processed(cand.model_id)
+    s.storage.set_counter(key, 0)
+    metrics.incr("uncertain_escalated")
+    logger.error(
+        "platform could not be queried for %s in %d consecutive ticks; marked NEEDS_HUMAN "
+        "so the candidate queue can advance", cand.model_id, streak)
+
+
+def _clear_uncertain(s: Deps, cand) -> None:
+    """候选这一轮问出结果了：清零连续计数（只在非零时写，避免每个候选一次无谓写盘）。"""
+    key = _uncertain_key(cand.model_id)
+    if s.storage.get_counter(key):
+        s.storage.set_counter(key, 0)
 
 
 if __name__ == "__main__":
