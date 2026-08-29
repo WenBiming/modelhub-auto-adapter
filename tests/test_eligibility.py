@@ -5,6 +5,7 @@ import pytest
 
 from auto_adapter.eligibility import Verdict, evaluate
 from auto_adapter.models import ModelSearchResult, Priority
+from auto_adapter.platform_client import PlatformClientError
 from auto_adapter.storage.sqlite import SqliteStorage
 
 GPU = "MetaX_c-500"
@@ -65,3 +66,66 @@ def test_bounty_does_not_override_duplicate(store, candidate):
 def test_platform_error_skips_conservatively(store, candidate):
     d = evaluate(candidate, GPU, store, _client(error=True))
     assert d.verdict == Verdict.SKIP_UNCERTAIN
+
+
+def _error_client(exc):
+    client = Mock()
+    client.search_model.side_effect = exc
+    return client
+
+
+def test_not_found_is_a_new_model_not_uncertainty(store, candidate):
+    """I2: 40400 NOT_FOUND is the platform's normal answer for a model it has never seen
+    — i.e. exactly the NEW_MODEL case this system exists to find. Folding it into
+    SKIP_UNCERTAIN made those candidates re-queried every tick forever (SKIP_UNCERTAIN
+    candidates are never marked processed) and left the NEW_MODEL path unreachable."""
+    d = evaluate(candidate, GPU, store, _error_client(PlatformClientError(40400, "not found")))
+    assert d.verdict == Verdict.ENQUEUE and d.priority == Priority.NEW_MODEL
+
+
+def test_not_found_bounty_still_gets_bounty_priority(store, candidate):
+    c = replace(candidate, is_bounty=True)
+    d = evaluate(c, GPU, store, _error_client(PlatformClientError(40400, "not found")))
+    assert d.verdict == Verdict.ENQUEUE and d.priority == Priority.BOUNTY
+
+
+@pytest.mark.parametrize("exc", [
+    PlatformClientError(50000, "system error"),
+    PlatformClientError(50001, "operation error"),
+    ConnectionError("down"),
+])
+def test_other_platform_errors_remain_uncertain(store, candidate, exc):
+    """Everything that is not a definite "no such model" still means we cannot tell
+    whether an adaptation already exists — 宁漏勿重."""
+    assert evaluate(candidate, GPU, store, _error_client(exc)).verdict == Verdict.SKIP_UNCERTAIN
+
+
+@pytest.mark.parametrize("code", [40100, 40101])
+def test_credential_error_trips_kill_switch(store, candidate, code):
+    """I3: an expired Xc-Token seen during eligibility must raise the alarm, not be
+    swallowed as one more uncertain candidate."""
+    d = evaluate(candidate, GPU, store, _error_client(PlatformClientError(code, "auth")))
+    assert d.verdict == Verdict.SKIP_UNCERTAIN
+    assert store.kill_switch() is True
+
+
+def test_verify_result_populates_gpu_coverage(store, candidate):
+    """I9: set_gpu_coverage had no caller, so gpu_coverage() was always empty and
+    select_target_gpu always returned KNOWN_GPUS[0] — expanding KNOWN_GPUS (a documented
+    pre-launch step) would have had no effect at all. eligibility already holds the
+    per-GPU verification data, so it records it."""
+    from auto_adapter import config_gen, rules
+
+    evaluate(candidate, GPU, store, _client({"gpu-a": {"passed": True}}))
+    other = replace(candidate, model_id="org/second")
+    evaluate(other, GPU, store, _client({"gpu-a": {"passed": True}}))
+
+    assert store.gpu_coverage()["gpu-a"] == 2
+
+    # and the coverage actually steers card selection once more GPUs are known
+    original = list(rules.KNOWN_GPUS)
+    rules.KNOWN_GPUS[:] = ["gpu-a", "gpu-b"]
+    try:
+        assert config_gen.select_target_gpu(store) == "gpu-b"  # the least covered one
+    finally:
+        rules.KNOWN_GPUS[:] = original

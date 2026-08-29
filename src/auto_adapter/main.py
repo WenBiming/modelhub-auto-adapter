@@ -29,6 +29,12 @@ from .storage.base import DuplicateTaskError
 
 logger = logging.getLogger(__name__)
 
+# 单 tick 内最多评估多少个候选。每个候选的 eligibility.evaluate 都要打一次平台
+# search_model（HTTP 超时 10s），30s 优雅停机预算下不能让候选循环无限长：待处理
+# 候选表可能一次涌入几百条（一次 HF 拉取 50 条 × 多个 tick 累积）。超出的部分不标
+# processed，留到下个 tick，顺序不变。
+MAX_CANDIDATES_PER_TICK = 20
+
 
 def run_loop(tick_fn, stop_event: threading.Event, interval_seconds: float) -> None:
     while not stop_event.is_set():
@@ -65,12 +71,15 @@ def build_deps(settings: Settings) -> Deps:
     （见 discovery/base.py），来源顺序体现这一优先级意图。HuggingFace 源
     仅在 settings.hf_discovery_enabled 为真时纳入。
     """
+    storage = SqliteStorage(settings.storage_path)
     sources = [ManualBountySource(settings.bounty_config_path)]
     if settings.hf_discovery_enabled:
-        sources.append(HuggingFaceSource(limit=settings.hf_fetch_limit))
+        # storage 注入：HF 的 1h 节流时间戳必须落盘，否则崩溃重启循环会每次重启
+        # 都打一遍 HuggingFace（CLAUDE.md：禁止业务模块自建内存态）。
+        sources.append(HuggingFaceSource(storage, limit=settings.hf_fetch_limit))
     return Deps(
         settings=settings,
-        storage=SqliteStorage(settings.storage_path),
+        storage=storage,
         client=PlatformClient(settings.base_url, settings.xc_token),
         sources=sources,
     )
@@ -81,12 +90,31 @@ def tick(deps: Deps, stop_event: threading.Event) -> None:
     config_gen + storage.insert_task → submitter.drain → monitor.poll → failure.handle。
 
     SKIP_UNCERTAIN 的候选不标记 processed，下个 tick 重试；其余判定结果
-    （ENQUEUE 成功/失败、SKIP_DUPLICATE）均标记 processed。
+    （ENQUEUE 成功/失败/需人工、SKIP_DUPLICATE）均标记 processed。
+
+    metrics 在 finally 里 flush + 清零：提前 return（停机）或抛异常的 tick 也必须
+    留下一行 JSON，否则最值得看的那些 tick 恰好什么都不打。
     """
     s = deps
+    try:
+        _tick_body(s, stop_event)
+    finally:
+        try:
+            metrics.flush_tick_summary(kill_switch=s.storage.kill_switch_state())
+        except Exception:
+            logger.exception("failed to flush tick metrics")
+        metrics.reset()  # 逐 tick 计数：flush 后清零，日志流每行反映"这一 tick"而非累计值
+
+
+def _tick_body(s: Deps, stop_event: threading.Event) -> None:
     metrics.incr("candidates_discovered", discovery.run(s.sources, s.storage))
     target_gpu = config_gen.select_target_gpu(s.storage)  # 覆盖率缓存 loop 内不变，提前一次读取
-    for cand in s.storage.pending_candidates():
+    pending = s.storage.pending_candidates()
+    if len(pending) > MAX_CANDIDATES_PER_TICK:
+        logger.info("evaluating %d of %d pending candidates this tick",
+                    MAX_CANDIDATES_PER_TICK, len(pending))
+        pending = pending[:MAX_CANDIDATES_PER_TICK]
+    for cand in pending:
         if stop_event.is_set():
             return
         decision = eligibility.evaluate(cand, target_gpu, s.storage, s.client)
@@ -96,6 +124,11 @@ def tick(deps: Deps, stop_event: threading.Event) -> None:
         if decision.verdict == Verdict.ENQUEUE:
             try:
                 req = config_gen.build_request(cand, target_gpu, s.settings.strategy_id)
+            except config_gen.UnresolvableCandidateError as e:
+                _insert_needs_human(s, cand, target_gpu, decision, e)
+                s.storage.mark_candidate_processed(cand.model_id)
+                continue
+            try:
                 s.storage.insert_task(TaskRecord(
                     model_id=cand.model_id, target_gpu=target_gpu,
                     framework=req.framework, status=TaskStatus.QUEUED,
@@ -103,9 +136,6 @@ def tick(deps: Deps, stop_event: threading.Event) -> None:
                     task_type=req.task_type, config_params=req.config_params,
                     bounty_deadline=cand.bounty_deadline))
                 metrics.incr("enqueued")
-            except ValueError:
-                metrics.incr("unresolvable_task_type")
-                logger.warning("cannot resolve task type for %s; needs human", cand.model_id)
             except DuplicateTaskError:
                 metrics.incr("skipped_duplicate")
         else:
@@ -116,12 +146,30 @@ def tick(deps: Deps, stop_event: threading.Event) -> None:
     metrics.incr("submitted", submitter.drain(s.storage, s.client, s.settings))
     if stop_event.is_set():
         return
-    monitor.poll(s.storage, s.client, s.settings)
+    monitor.poll(s.storage, s.client, s.settings, stop_event=stop_event)
     if stop_event.is_set():
         return
     failure.handle(s.storage, s.client, s.settings)
-    metrics.flush_tick_summary()
-    metrics.reset()  # 逐 tick 计数：flush 后清零，日志流每行反映"这一 tick"而非累计值
+
+
+def _insert_needs_human(s: Deps, cand, target_gpu: str, decision,
+                        error: config_gen.UnresolvableCandidateError) -> None:
+    """无法自动组装提交参数的候选：落一条 NEEDS_HUMAN 记录（spec §4.4）。
+
+    只打一行 warning 然后把候选标成 processed 等于让它凭空消失——悬赏候选尤其
+    不能这样丢。记录里带上 model_url/model_id/target_gpu，人工可以直接接手。
+    """
+    metrics.incr(error.reason)
+    logger.warning("%s: %s", error.reason, error)
+    try:
+        s.storage.insert_task(TaskRecord(
+            model_id=cand.model_id, target_gpu=target_gpu,
+            framework=error.framework, status=TaskStatus.NEEDS_HUMAN,
+            priority=decision.priority, model_url=cand.model_url,
+            task_type="", config_params="",
+            bounty_deadline=cand.bounty_deadline))
+    except DuplicateTaskError:
+        pass  # 已有记录（含之前落的 NEEDS_HUMAN），无须重复插入
 
 
 if __name__ == "__main__":

@@ -2,32 +2,40 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 
 from . import rules
 from .failure import classify
-from .models import FailureKind, TaskStatus
-from .platform_client import PlatformClient
+from .models import FailureKind, TaskRecord, TaskStatus, ensure_utc
+from .platform_client import PlatformClient, escalate_if_credential_error
 from .settings import Settings
 from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
 # 单个 tick 内 list_my_tasks 分页枚举的硬上限：list_my_tasks 是账号全部任务历史的分页
-# 列表（onlyMine=true），服务长期运行后总任务数必然超过一页；上限约束单次 tick 的
-# 工作量，保证每个 tick 步骤在 30s 内完成（优雅停机要求）。
+# 列表（onlyMine=true），服务长期运行后总任务数必然超过一页。
+#
+# 注意 MAX_PAGES 本身**不足以**保证 30s 优雅停机预算：20 页 × 10s HTTP 超时最坏 200s。
+# 真正的停机保证来自 poll(stop_event=...)——SIGTERM 一到就中断翻页并返回 "truncated"
+# （从而自动关闭"消失"判定）。MAX_PAGES 只限制单 tick 的正常工作量上限。
 MAX_PAGES = 20
 
 
-def _fetch_platform_rows(client: PlatformClient) -> tuple[dict[int, dict], str]:
+def _fetch_platform_rows(
+    client: PlatformClient,
+    storage: Storage | None = None,
+    stop_event: threading.Event | None = None,
+) -> tuple[dict[int, dict], str]:
     """拉取 list_my_tasks 全部分页，累积为 {taskId: row}。
 
     返回 (platform_rows, outcome)，outcome ∈ {"complete", "truncated", "failed"}：
 
     - "complete"：已读完平台报告的全部页（响应的 pages 字段），或提前遇到空页——
       这是唯一允许据此判定"平台侧消失"的情形；
-    - "truncated"：达到 MAX_PAGES 上限仍未读完，只返回已读到的行；调用方不得据此
-      判定任务消失（可能只是还没翻到那一页）；
+    - "truncated"：达到 MAX_PAGES 上限、或收到停机信号提前中断，只返回已读到的行；
+      调用方不得据此判定任务消失（可能只是还没翻到那一页）；
     - "failed"：第 2 页起请求异常，只返回已读到的行，同样不得判定消失。
 
     第一页请求异常直接向上抛出，由调用方决定是否完全跳过本轮、不触碰任何本地状态
@@ -40,6 +48,13 @@ def _fetch_platform_rows(client: PlatformClient) -> tuple[dict[int, dict], str]:
     pages_read = 1
 
     while rows and pages_read < total_pages:
+        if stop_event is not None and stop_event.is_set():
+            # SIGTERM：立刻停止翻页（每页最坏 10s，翻完可能远超 30s 宽限期）。
+            # 返回 truncated 而非 complete——"消失"判定本 tick 自动失效。
+            logger.warning(
+                "shutdown requested during list_my_tasks pagination after %d/%d pages; "
+                "vanish check skipped this tick", pages_read, total_pages)
+            return platform_rows, "truncated"
         if pages_read >= MAX_PAGES:
             logger.warning(
                 "list_my_tasks enumeration hit MAX_PAGES=%d cap (platform reports %d pages); "
@@ -47,7 +62,9 @@ def _fetch_platform_rows(client: PlatformClient) -> tuple[dict[int, dict], str]:
             return platform_rows, "truncated"
         try:
             page = client.list_my_tasks(current=pages_read + 1, page_size=100)
-        except Exception:
+        except Exception as e:
+            if storage is not None:
+                escalate_if_credential_error(storage, e)
             logger.exception(
                 "list_my_tasks page %d failed; enumeration incomplete, vanish check skipped",
                 pages_read + 1)
@@ -60,47 +77,112 @@ def _fetch_platform_rows(client: PlatformClient) -> tuple[dict[int, dict], str]:
     return platform_rows, "complete"
 
 
+def _parse_platform_time(raw) -> datetime | None:
+    """解析平台 date-time 字段（附录 A.3 未给出精确格式，尽力而为）。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip().replace("Z", "+00:00")
+    try:
+        return ensure_utc(datetime.fromisoformat(text))
+    except ValueError:
+        logger.debug("unparsable platform time %r", raw)
+        return None
+
+
+def _progress_time(rec: TaskRecord, row: dict) -> datetime | None:
+    """超时判定基准：优先平台行的 updateTime（附录 A.3 指定的进度信号），
+    缺失或无法解析时退回本地 submit_time。
+
+    只看 submit_time 会把稳步推进中的长任务在 6h 处误杀；updateTime 才反映平台侧
+    是否还在动。
+    """
+    return _parse_platform_time(row.get("updateTime")) or ensure_utc(rec.submit_time)
+
+
+def _check_timeout(storage: Storage, rec: TaskRecord, row: dict,
+                   now: datetime, timeout: timedelta) -> None:
+    progressed_at = _progress_time(rec, row)
+    if progressed_at is not None and now - progressed_at > timeout:
+        rec.status = TaskStatus.TIMEOUT
+        storage.update_task(rec)
+
+
+def _match_orphan(rec: TaskRecord, platform_rows: dict[int, dict]) -> dict | None:
+    """按 (modelId, gpuType) 在平台行里找孤儿记录对应的任务（附录 A.3）。
+
+    同一对可能有多行（历史重试）；取 taskId 最大的一行，即最近创建的那个。
+    """
+    matches = [row for row in platform_rows.values()
+               if row.get("modelId") == rec.model_id and row.get("gpuType") == rec.target_gpu]
+    if not matches:
+        return None
+    return max(matches, key=lambda r: r.get("taskId", 0))
+
+
 def poll(storage: Storage, client: PlatformClient, settings: Settings,
-         now: datetime | None = None) -> None:
+         now: datetime | None = None,
+         stop_event: threading.Event | None = None) -> None:
     """对账并更新本地任务表：
 
     - list_my_tasks（onlyMine=true）分页拉取账号全部任务历史（非仅在途任务），以平台
       status/verifyResult 为准更新 TaskRecord；分页读取见 `_fetch_platform_rows`——
       "消失"判定只在完整读完所有页时才成立，避免把"还没翻到的页"误判为任务丢失；
-    - 本地记录 task_id 为 None（PENDING 意图已落盘但 add_task 未完成）→ NEEDS_HUMAN，
-      不算平台侧消失，不触发 kill switch（该告警只保留给平台已接单又丢失的任务）；
+    - 本地记录 task_id 为 None（PENDING 意图已落盘但 add_task 结果不可知）→ 先按
+      (modelId, gpuType) 在平台列表里认领回 task_id、恢复正常对账；只有枚举完整且
+      确实无匹配行时才标 NEEDS_HUMAN；枚举不完整就原样留到下个 tick；
     - 本地在途但平台侧（完整枚举后）消失的任务 → ABANDONED + set_kill_switch(True)
       （可能被违规清理，最高级别告警，暂停提交待人工确认）；
-    - 失败任务拉日志存入 record.last_log，留给 failure 层分类；
+    - 失败任务拉日志存入 record.last_log，留给 failure 层分类；日志拉取失败时**不**
+      改状态（classify("") 会误判成 ENGINE，触发 spec §4.7 明令禁止的质量失败重试）；
     - SUCCESS 时清零 consecutive_engine_failures 计数（成功即重置熔断）；
-    - PENDING/RUNNING 超过 task_timeout_hours → 标记 TIMEOUT。
+    - PENDING/RUNNING 距 updateTime（缺失时 submit_time）超过 task_timeout_hours
+      → 标记 TIMEOUT；
+    - stop_event 置位时中断分页（优雅停机），本 tick 不做消失判定。
     """
     now = now or datetime.now(timezone.utc)
     records = storage.tasks_by_status(TaskStatus.PENDING, TaskStatus.RUNNING)
     if not records:
         return
 
-    # 分离出 task_id 缺失的记录：Task 7 会在调用 add_task 前先落盘 PENDING 意图，
-    # 若中途写入平台失败，task_id 会是 None——这不是"平台侧消失"，须先于对账处理。
+    # task_id 缺失的记录：submitter 在调用 add_task 前先落盘 PENDING 意图，若提交结果
+    # 不可知（传输层超时/50000），task_id 会是 None。平台很可能已经建了单——所以先按
+    # (modelId, gpuType) 去平台列表认领，而不是直接判死丢弃。
     orphans = [r for r in records if r.task_id is None]
     records = [r for r in records if r.task_id is not None]
-    for rec in orphans:
-        rec.status = TaskStatus.NEEDS_HUMAN
-        storage.update_task(rec)
-        logger.warning(
-            "task record for model %s has no task_id (submit likely failed mid-flight); "
-            "marked NEEDS_HUMAN", rec.model_id)
-
-    if not records:
-        return
 
     try:
-        platform_rows, outcome = _fetch_platform_rows(client)
-    except Exception:
+        platform_rows, outcome = _fetch_platform_rows(client, storage, stop_event)
+    except Exception as e:
+        escalate_if_credential_error(storage, e)
         logger.exception("list_my_tasks failed; will retry next tick")
         return
 
     enumeration_complete = outcome == "complete"
+
+    for rec in orphans:
+        row = _match_orphan(rec, platform_rows)
+        if row is not None:
+            rec.task_id = int(row["taskId"])
+            storage.update_task(rec)
+            logger.warning(
+                "reattached orphan record %s@%s to platform task %s (submit outcome was "
+                "unknown; the platform did create it)",
+                rec.model_id, rec.target_gpu, rec.task_id)
+            records.append(rec)
+        elif enumeration_complete:
+            rec.status = TaskStatus.NEEDS_HUMAN
+            storage.update_task(rec)
+            logger.warning(
+                "task record for model %s has no task_id and no matching platform row "
+                "(enumeration complete); marked NEEDS_HUMAN", rec.model_id)
+        else:
+            logger.warning(
+                "task record for model %s has no task_id; platform enumeration was %s, "
+                "leaving it untouched for the next tick", rec.model_id, outcome)
+
+    if not records:
+        return
+
     timeout = timedelta(hours=settings.task_timeout_hours)
 
     for rec in records:
@@ -123,9 +205,16 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
         if mapped == "failed":
             try:
                 rec.last_log = client.get_task_log(rec.task_id)
-            except Exception:
-                logger.exception("get_task_log failed for %s", rec.task_id)
-                rec.last_log = ""
+            except Exception as e:
+                # 拿不到日志就分不了类。这里曾经写 last_log=""，而 classify("") 返回
+                # ENGINE——一次瞬时的日志拉取失败会让 QUALITY 失败被自动重试最多 3 次，
+                # 正是 spec §4.7 明令禁止的。保持当前状态，下个 tick 再试。
+                escalate_if_credential_error(storage, e)
+                logger.exception(
+                    "get_task_log failed for task %s; leaving %s@%s unclassified, retry next tick",
+                    rec.task_id, rec.model_id, rec.target_gpu)
+                _check_timeout(storage, rec, row, now, timeout)  # 超时仍然兜底
+                continue
             kind = classify(rec.last_log)
             rec.status = (TaskStatus.QUALITY_FAILED if kind == FailureKind.QUALITY
                           else TaskStatus.ENGINE_FAILED)
@@ -145,6 +234,4 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
             rec.status = mapped
             storage.update_task(rec)
 
-        if rec.submit_time is not None and now - rec.submit_time > timeout:
-            rec.status = TaskStatus.TIMEOUT
-            storage.update_task(rec)
+        _check_timeout(storage, rec, row, now, timeout)

@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 import pytest
+import requests
 
 from auto_adapter import submitter
 from auto_adapter.models import Priority, TaskRecord, TaskStatus
@@ -183,3 +184,81 @@ def test_task_id_persist_failure_stops_submissions(store):
     queued = store.tasks_by_status(TaskStatus.QUEUED)
     assert len(queued) == 1
     assert queued[0].model_id == "org/second"
+
+
+def test_transport_error_leaves_record_pending_and_never_resubmits(store):
+    """C1 safety property: a ReadTimeout means the outcome is UNKNOWN — the platform may
+    already have created the task. Reverting to QUEUED would resubmit the same
+    (model_id, target_gpu) next tick, which is exactly what triggers the platform's
+    purge-all-tasks duplicate detection. The record must stay out of QUEUED, and a
+    second drain over the same storage must not call add_task again."""
+    store.insert_task(_queued("org/timeout"))
+    client = Mock()
+    client.add_task.side_effect = requests.exceptions.ReadTimeout("read timed out")
+
+    assert submitter.drain(store, client, SETTINGS, now=NOW) == 0
+
+    assert store.tasks_by_status(TaskStatus.QUEUED) == []
+    rec = store.get_task("org/timeout", "MetaX_c-500")
+    assert rec.status == TaskStatus.PENDING and rec.task_id is None
+
+    client.add_task.reset_mock()
+    submitter.drain(store, client, SETTINGS, now=NOW)
+    client.add_task.assert_not_called()
+
+
+def test_http_error_leaves_record_pending(store):
+    """An HTTPError from raise_for_status is equally ambiguous: the request reached the
+    platform, and the response may have been lost after the task was created."""
+    store.insert_task(_queued("org/http"))
+    client = Mock()
+    client.add_task.side_effect = requests.exceptions.HTTPError("502 Bad Gateway")
+
+    assert submitter.drain(store, client, SETTINGS, now=NOW) == 0
+
+    assert store.tasks_by_status(TaskStatus.QUEUED) == []
+    assert store.get_task("org/http", "MetaX_c-500").status == TaskStatus.PENDING
+
+
+@pytest.mark.parametrize("code", [50000, 50001])
+def test_transient_platform_code_leaves_record_pending(store, code):
+    """50000/50001 are platform-internal errors: whether the task got created is unknown,
+    so the record must not go back to QUEUED."""
+    store.insert_task(_queued("org/transient"))
+    client = Mock()
+    client.add_task.side_effect = PlatformClientError(code, "system error")
+
+    assert submitter.drain(store, client, SETTINGS, now=NOW) == 0
+
+    assert store.tasks_by_status(TaskStatus.QUEUED) == []
+    assert store.get_task("org/transient", "MetaX_c-500").status == TaskStatus.PENDING
+
+
+@pytest.mark.parametrize("code", [40100, 40101, 40400, 40001])
+def test_definite_rejection_reverts_to_queued(store, code):
+    """The other half of C1: a business-code rejection means the platform did NOT create
+    a task, so returning the record to QUEUED for a later retry is safe (and required —
+    otherwise every rejected candidate would need manual reconciliation)."""
+    store.insert_task(_queued("org/rejected"))
+    client = Mock()
+    client.add_task.side_effect = PlatformClientError(code, "rejected")
+
+    assert submitter.drain(store, client, SETTINGS, now=NOW) == 0
+
+    rec = store.get_task("org/rejected", "MetaX_c-500")
+    assert rec.status == TaskStatus.QUEUED
+    assert rec.task_id is None and rec.submit_time is None
+
+
+def test_naive_bounty_deadline_does_not_crash_drain(store):
+    """I1: a hand-written bounty JSON deadline without an offset yields a naive datetime.
+    Comparing it against an aware `now` (and sorting it alongside aware deadlines) used to
+    raise TypeError, killing the submit stage on every tick."""
+    naive = _queued("org/naive", Priority.BOUNTY)
+    naive.bounty_deadline = datetime(2026, 9, 30)  # naive
+    store.insert_task(naive)
+    store.insert_task(_queued("org/aware", Priority.BOUNTY, NOW + timedelta(days=3)))
+    client = Mock()
+    client.add_task.side_effect = [1, 2]
+
+    assert submitter.drain(store, client, SETTINGS, now=NOW) == 2

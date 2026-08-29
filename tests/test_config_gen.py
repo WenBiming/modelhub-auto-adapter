@@ -67,3 +67,29 @@ def test_build_request_unresolvable_raises(candidate):
     c = replace(candidate, pipeline_tag=None, model_id="org/mystery")
     with pytest.raises(ValueError):
         config_gen.build_request(c, "MetaX_c-500", "uuid-1")
+
+
+def test_build_request_refuses_non_vllm_candidate(candidate):
+    """Ruling: v0.1 must not submit non-vllm candidates. templates/transformers.yaml is an
+    explicit placeholder ("command 字段结构为占位符，待平台确认"), and the retry ladder only
+    tunes tp/memory/context — it cannot fix a wrong launch command. Such a candidate would
+    burn 3 submissions and end up permanently blacklisted. Route it to a human instead."""
+    c = replace(candidate, pipeline_tag="feature-extraction")
+    assert config_gen.resolve_framework(c) != "vllm"  # precondition
+
+    with pytest.raises(config_gen.UnresolvableCandidateError) as exc:
+        config_gen.build_request(c, "MetaX_c-500", "uuid-1")
+    assert exc.value.reason == "unsupported_framework"
+    assert exc.value.framework == "transformers"
+
+
+def test_build_request_unresolvable_task_type_reason(candidate):
+    c = replace(candidate, pipeline_tag=None, model_id="org/mystery")
+    with pytest.raises(config_gen.UnresolvableCandidateError) as exc:
+        config_gen.build_request(c, "MetaX_c-500", "uuid-1")
+    assert exc.value.reason == "unresolvable_task_type"
+
+
+def test_vllm_candidate_still_builds(candidate):
+    req = config_gen.build_request(candidate, "MetaX_c-500", "uuid-1")
+    assert req.framework == "vllm"

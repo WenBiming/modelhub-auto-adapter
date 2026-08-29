@@ -8,6 +8,7 @@ import yaml
 
 from auto_adapter import config_gen, failure
 from auto_adapter.models import FailureKind, Priority, TaskRecord, TaskStatus
+from auto_adapter.platform_client import PlatformClientError
 from auto_adapter.settings import Settings
 from auto_adapter.storage.sqlite import SqliteStorage
 
@@ -107,8 +108,11 @@ def test_handle_quality_failure_needs_human(store):
 
 
 def test_handle_timeout_stops_and_requeues_bounty(store):
+    """Success path: a confirmed stop (stop_tasks → True) released the platform task,
+    so requeueing the bounty cannot collide with a still-running task."""
     store.insert_task(_failed(TaskStatus.TIMEOUT, deadline=NOW + timedelta(days=1)))
     client = Mock()
+    client.stop_tasks.return_value = True
     failure.handle(store, client, SETTINGS, now=NOW)
     client.stop_tasks.assert_called_once_with([7])
     assert store.get_task("org/m", "MetaX_c-500").status == TaskStatus.QUEUED
@@ -117,27 +121,103 @@ def test_handle_timeout_stops_and_requeues_bounty(store):
 def test_handle_timeout_abandons_non_bounty(store):
     store.insert_task(_failed(TaskStatus.TIMEOUT))
     client = Mock()
+    client.stop_tasks.return_value = True
     failure.handle(store, client, SETTINGS, now=NOW)
     assert store.get_task("org/m", "MetaX_c-500").status == TaskStatus.ABANDONED
 
 
-def test_handle_timeout_requeues_bounty_even_if_stop_tasks_fails(store):
-    # stop_tasks is best-effort resource cleanup; its failure must not strand the
-    # record in TIMEOUT.
+def test_handle_timeout_does_not_requeue_when_stop_tasks_raises(store):
+    """Safety property (C2): a bounty must NOT be requeued while the old platform task
+    may still be running. stop_tasks raising means the stop was never confirmed, so
+    resubmitting the same (model_id, target_gpu) risks the platform's duplicate-submission
+    purge. The record stays in TIMEOUT and is retried next tick."""
     store.insert_task(_failed(TaskStatus.TIMEOUT, deadline=NOW + timedelta(days=1)))
     client = Mock()
     client.stop_tasks.side_effect = ConnectionError("boom")
+
     failure.handle(store, client, SETTINGS, now=NOW)
+
     client.stop_tasks.assert_called_once_with([7])
-    assert store.get_task("org/m", "MetaX_c-500").status == TaskStatus.QUEUED
+    assert store.get_task("org/m", "MetaX_c-500").status == TaskStatus.TIMEOUT
 
 
-def test_handle_timeout_abandons_non_bounty_even_if_stop_tasks_fails(store):
+def test_handle_timeout_does_not_abandon_when_stop_tasks_returns_false(store):
+    """stop_tasks returns bool (appendix A.5). A False return means the stop did not
+    land, and is treated exactly like an exception: no transition, retry next tick."""
     store.insert_task(_failed(TaskStatus.TIMEOUT))
     client = Mock()
-    client.stop_tasks.side_effect = ConnectionError("boom")
+    client.stop_tasks.return_value = False
+
     failure.handle(store, client, SETTINGS, now=NOW)
-    assert store.get_task("org/m", "MetaX_c-500").status == TaskStatus.ABANDONED
+
+    assert store.get_task("org/m", "MetaX_c-500").status == TaskStatus.TIMEOUT
+
+
+def test_repeated_stop_failures_escalate_to_needs_human(store):
+    """A record must not sit in TIMEOUT forever: after _MAX_STOP_ATTEMPTS ticks in which
+    the stop never landed, a human has to see it. The attempt counter is separate from
+    retry_count (the tuning-ladder index), which must not be consumed here."""
+    store.insert_task(_failed(TaskStatus.TIMEOUT, deadline=NOW + timedelta(days=1)))
+    client = Mock()
+    client.stop_tasks.return_value = False
+
+    for _ in range(failure._MAX_STOP_ATTEMPTS - 1):
+        failure.handle(store, client, SETTINGS, now=NOW)
+        rec = store.get_task("org/m", "MetaX_c-500")
+        assert rec.status == TaskStatus.TIMEOUT
+        assert rec.retry_count == 0  # ladder index untouched
+
+    failure.handle(store, client, SETTINGS, now=NOW)
+    rec = store.get_task("org/m", "MetaX_c-500")
+    assert rec.status == TaskStatus.NEEDS_HUMAN
+    assert rec.retry_count == 0
+
+
+def test_stop_tasks_credential_error_trips_kill_switch(store):
+    """I3: an expired Xc-Token surfacing in the failure stage must trip the kill switch
+    rather than be swallowed by the generic handler (which turns the agent into a
+    silent no-op)."""
+    store.insert_task(_failed(TaskStatus.TIMEOUT))
+    client = Mock()
+    client.stop_tasks.side_effect = PlatformClientError(40100, "not login")
+
+    failure.handle(store, client, SETTINGS, now=NOW)
+
+    assert store.kill_switch() is True
+
+
+def test_poison_config_params_does_not_starve_other_records(store):
+    """I7: yaml.safe_load("") returns None and next_config then raises. That exception
+    used to escape handle() on every tick, so no engine failure anywhere in the batch was
+    ever processed again. The bad record goes NEEDS_HUMAN; the rest still get handled."""
+    poison = _failed(retry_count=0)
+    poison.model_id = "org/poison"
+    poison.config_params = ""
+    store.insert_task(poison)
+    healthy = _failed(retry_count=0)
+    healthy.model_id = "org/healthy"
+    store.insert_task(healthy)
+
+    failure.handle(store, Mock(), SETTINGS, now=NOW)
+
+    assert store.get_task("org/poison", "MetaX_c-500").status == TaskStatus.NEEDS_HUMAN
+    good = store.get_task("org/healthy", "MetaX_c-500")
+    assert good.status == TaskStatus.QUEUED and good.retry_count == 1
+
+
+def test_naive_bounty_deadline_does_not_crash_handle(store):
+    """I1: a hand-written bounty deadline without an offset round-trips through storage as
+    a naive datetime; comparing it with an aware `now` used to raise TypeError and kill
+    the whole failure stage every tick."""
+    rec = _failed(TaskStatus.TIMEOUT)
+    rec.bounty_deadline = datetime(2026, 9, 30)  # naive, as hand-written JSON produces
+    store.insert_task(rec)
+    client = Mock()
+    client.stop_tasks.return_value = True
+
+    failure.handle(store, client, SETTINGS, now=NOW)
+
+    assert store.get_task("org/m", "MetaX_c-500").status == TaskStatus.QUEUED
 
 
 def test_engine_failure_streak_triggers_kill_switch(store):

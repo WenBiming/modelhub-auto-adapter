@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
@@ -5,6 +6,7 @@ import pytest
 
 from auto_adapter import monitor
 from auto_adapter.models import Priority, TaskRecord, TaskStatus
+from auto_adapter.platform_client import PlatformClientError
 from auto_adapter.settings import Settings
 from auto_adapter.storage.sqlite import SqliteStorage
 
@@ -159,3 +161,151 @@ def test_pending_with_no_task_id_marked_needs_human(store, caplog):
     assert rec.status == TaskStatus.NEEDS_HUMAN
     assert store.kill_switch() is False
     assert "org/a" in caplog.text
+
+
+def _row(task_id, status="RUNNING", model_id="org/a", gpu="MetaX_c-500", **extra):
+    return {"taskId": task_id, "status": status,
+            "modelId": model_id, "gpuType": gpu, **extra}
+
+
+def test_log_fetch_failure_does_not_classify_as_engine(store):
+    """I4: classify("") returns ENGINE, so writing last_log="" on a get_task_log failure
+    turned a QUALITY failure into an engine failure eligible for up to 3 automatic
+    retries — the one thing spec §4.7 says must never be auto-retried. On a log-fetch
+    failure the record must keep its current status and be retried next tick."""
+    store.insert_task(_pending("org/a", 1))
+    client = Mock()
+    client.list_my_tasks.return_value = _page(_row(1, "FAILED"))
+    client.get_task_log.side_effect = ConnectionError("log service down")
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.status == TaskStatus.PENDING
+    assert rec.status != TaskStatus.ENGINE_FAILED
+
+
+def test_log_fetch_failure_still_honours_timeout(store):
+    """The unclassified record is still bounded: a stale task times out normally."""
+    store.insert_task(_pending("org/a", 1, submit_time=NOW - timedelta(hours=7)))
+    client = Mock()
+    client.list_my_tasks.return_value = _page(_row(1, "FAILED"))
+    client.get_task_log.side_effect = ConnectionError("log service down")
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.TIMEOUT
+
+
+def test_orphan_is_reattached_by_model_and_gpu(store):
+    """I5: a PENDING record with task_id=None means the submit outcome was unknown — the
+    platform may well have created the task. The listing carries modelId/gpuType
+    (appendix A.3), so the task_id is recoverable and normal reconciliation resumes.
+    Discarding it as NEEDS_HUMAN threw away a live task."""
+    store.insert_task(_pending("org/a", None))
+    client = Mock()
+    client.list_my_tasks.return_value = _page(_row(777, "RUNNING", model_id="org/a"))
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.task_id == 777
+    assert rec.status == TaskStatus.RUNNING  # reconciled in the same tick
+    assert store.kill_switch() is False
+
+
+def test_orphan_with_no_matching_row_needs_human(store):
+    """Only a COMPLETE enumeration with no matching (modelId, gpuType) row proves the
+    platform never created the task."""
+    store.insert_task(_pending("org/a", None))
+    client = Mock()
+    client.list_my_tasks.return_value = _page(_row(5, "RUNNING", model_id="org/other"))
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.NEEDS_HUMAN
+    assert store.kill_switch() is False
+
+
+def test_orphan_left_untouched_when_enumeration_incomplete(store):
+    """If the listing is truncated/failed we cannot tell whether the task exists, so the
+    orphan must survive to the next tick rather than be written off."""
+    store.insert_task(_pending("org/a", None))
+    client = Mock()
+
+    def list_my_tasks(current=1, page_size=50, **filters):
+        if current == 1:
+            return {"records": [_row(1, model_id="org/other")],
+                    "total": 2, "current": 1, "pages": 2, "size": 100}
+        raise ConnectionError("page 2 down")
+
+    client.list_my_tasks.side_effect = list_my_tasks
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.status == TaskStatus.PENDING and rec.task_id is None
+
+
+def test_stop_event_during_pagination_never_escalates_a_vanish(store):
+    """I6: MAX_PAGES(20) x 10s HTTP timeout can far exceed the 30s shutdown budget, so
+    poll takes a stop_event. When it trips mid-pagination the enumeration is truncated,
+    which must disable the vanish check — otherwise a SIGTERM would abandon live tasks
+    and trip the kill switch."""
+    store.insert_task(_pending("org/a", 99))
+    stop_event = threading.Event()
+    client = Mock()
+
+    def list_my_tasks(current=1, page_size=50, **filters):
+        stop_event.set()  # SIGTERM arrives while page 1 is being handled
+        return {"records": [_row(9000 + current, model_id="org/decoy")],
+                "total": 500, "current": current, "pages": 500, "size": 100}
+
+    client.list_my_tasks.side_effect = list_my_tasks
+
+    monitor.poll(store, client, SETTINGS, now=NOW, stop_event=stop_event)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.status == TaskStatus.PENDING
+    assert rec.status != TaskStatus.ABANDONED
+    assert store.kill_switch() is False
+    assert client.list_my_tasks.call_count == 1  # stopped paginating immediately
+
+
+def test_timeout_uses_platform_update_time(store):
+    """M6: appendix A.3 designates updateTime as the progress signal. A task that has
+    been submitted for 7h but reported progress a minute ago is alive, not stuck —
+    timing it out would kill a task making steady progress (and cost a submission)."""
+    store.insert_task(_pending("org/a", 1, submit_time=NOW - timedelta(hours=7)))
+    client = Mock()
+    client.list_my_tasks.return_value = _page(
+        _row(1, "RUNNING", updateTime=(NOW - timedelta(minutes=1)).isoformat()))
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.RUNNING
+
+
+def test_timeout_triggers_when_update_time_is_stale(store):
+    """The other half of M6: no progress for longer than the budget is still a timeout,
+    even though the record was only just submitted."""
+    store.insert_task(_pending("org/a", 1, submit_time=NOW - timedelta(minutes=5)))
+    client = Mock()
+    client.list_my_tasks.return_value = _page(
+        _row(1, "RUNNING", updateTime=(NOW - timedelta(hours=7)).isoformat()))
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.TIMEOUT
+
+
+def test_credential_error_during_poll_trips_kill_switch(store):
+    """I3: monitor used to swallow a 40100 into its generic handler, so an expired
+    Xc-Token silently turned the whole agent into a no-op with no alarm."""
+    store.insert_task(_pending("org/a", 1))
+    client = Mock()
+    client.list_my_tasks.side_effect = PlatformClientError(40101, "no auth")
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    assert store.kill_switch() is True

@@ -128,3 +128,103 @@ def test_tick_resets_metrics_between_ticks(tmp_path, candidate, capsys):
     second_tick_metrics = json.loads(out.strip().splitlines()[-1])["metrics"]
 
     assert "enqueued" not in second_tick_metrics
+
+
+def _src(candidates):
+    class Src:
+        name = "fake"
+        def fetch(self):
+            return list(candidates)
+    return Src()
+
+
+def _deps(storage, client, sources=()):
+    return Deps(settings=Settings(xc_token="t", strategy_id="s", base_url="https://x"),
+                storage=storage, client=client, sources=list(sources))
+
+
+def test_unresolvable_candidate_leaves_a_needs_human_record(tmp_path, candidate):
+    """I8 (spec §4.4): a candidate whose task type cannot be resolved used to vanish with
+    nothing but a log line — the candidate was marked processed and never looked at again,
+    so a bounty could disappear silently. It must leave a record a human can find, with
+    enough context (model_url/model_id/target_gpu) to act on."""
+    from dataclasses import replace
+
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    client = Mock()
+    client.search_model.return_value = ModelSearchResult(False, {}, {})
+    client.list_my_tasks.return_value = {"records": []}
+    mystery = replace(candidate, pipeline_tag=None, model_id="org/mystery")
+
+    tick(_deps(storage, client, [_src([mystery])]), threading.Event())
+
+    rec = storage.get_task("org/mystery", "MetaX_c-500")
+    assert rec is not None and rec.status == TaskStatus.NEEDS_HUMAN
+    assert rec.model_url == mystery.model_url
+    client.add_task.assert_not_called()
+
+
+def test_non_vllm_candidate_is_not_submitted(tmp_path, candidate):
+    """Ruling: a non-vllm candidate must never reach add_task in v0.1; it lands as a
+    NEEDS_HUMAN record instead of burning submissions on a placeholder template."""
+    from dataclasses import replace
+
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    client = Mock()
+    client.search_model.return_value = ModelSearchResult(False, {}, {})
+    client.list_my_tasks.return_value = {"records": []}
+    embedder = replace(candidate, model_id="org/bge-small", pipeline_tag="feature-extraction")
+
+    tick(_deps(storage, client, [_src([embedder])]), threading.Event())
+
+    client.add_task.assert_not_called()
+    rec = storage.get_task("org/bge-small", "MetaX_c-500")
+    assert rec is not None and rec.status == TaskStatus.NEEDS_HUMAN
+
+
+def test_candidates_per_tick_is_capped_and_remainder_stays_pending(tmp_path, candidate):
+    """I2: each evaluation can cost a 10s platform call, so an unbounded candidate loop
+    blows the 30s shutdown budget. The overflow must stay pending, not be dropped."""
+    from dataclasses import replace
+
+    from auto_adapter import main as main_module
+
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    client = Mock()
+    client.search_model.return_value = ModelSearchResult(True, {}, {"MetaX_c-500": {}})
+    client.list_my_tasks.return_value = {"records": []}
+    many = [replace(candidate, model_id=f"org/m{i}")
+            for i in range(main_module.MAX_CANDIDATES_PER_TICK + 5)]
+
+    tick(_deps(storage, client, [_src(many)]), threading.Event())
+
+    assert client.search_model.call_count == main_module.MAX_CANDIDATES_PER_TICK
+    assert len(storage.pending_candidates()) == 5
+
+
+def test_metrics_are_flushed_even_when_the_tick_stops_early(tmp_path, candidate, capsys):
+    """M3: a tick that returns early on stop_event (or raises) still has to emit its
+    metrics line — otherwise the most interesting ticks are exactly the silent ones."""
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    stop_event = threading.Event()
+    stop_event.set()
+
+    tick(_deps(storage, Mock(), [_src([candidate])]), stop_event)
+
+    line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert "metrics" in line
+
+
+def test_metrics_line_reports_kill_switch_state_and_reason(tmp_path, capsys):
+    """M4: the kill switch is the only safety brake and /health returns 200 regardless,
+    so its state has to be visible somewhere an operator actually looks."""
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    storage.set_kill_switch(True, "task 42 vanished from platform")
+    client = Mock()
+    client.list_my_tasks.return_value = {"records": []}
+
+    tick(_deps(storage, client), threading.Event())
+
+    line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert line["kill_switch"]["on"] is True
+    assert "vanished" in line["kill_switch"]["reason"]
