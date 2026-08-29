@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 import yaml
 
-from .models import FailureKind, TaskRecord, TaskStatus
-from .platform_client import PlatformClient
+from .models import FailureKind, TaskRecord, TaskStatus, ensure_utc
+from .platform_client import PlatformClient, escalate_if_credential_error
 from .settings import Settings
 from .storage import Storage
 
@@ -22,6 +22,15 @@ _MIN_MODEL_LEN, _MAX_TP = 2048, 4
 # 连续引擎失败熔断阈值（spec §6：连续失败告警——可能是本系统配置模板本身有问题，
 # 需要人工介入而非无限重试）。成功任务由 Task 8 的 monitor.poll 清零该计数。
 _STREAK_LIMIT = 5
+
+# TIMEOUT 记录的 stop_tasks 尝试上限：连续 3 个 tick 都没能确认停止 → NEEDS_HUMAN，
+# 免得记录永远卡在 TIMEOUT 无人知晓。计数键与 task_id 绑定，和 retry_count（调参
+# 梯子的档位）严格分开，两者语义不同不能复用。
+_MAX_STOP_ATTEMPTS = 3
+
+
+def _stop_attempts_key(task_id: int) -> str:
+    return f"stop_attempts:{task_id}"
 
 
 def classify(log_text: str) -> FailureKind:
@@ -87,8 +96,11 @@ def handle(storage: Storage, client: PlatformClient, settings: Settings,
       给 consecutive_engine_failures 计数 +1，达到 _STREAK_LIMIT 时 set_kill_switch
       （spec §6）；
     - QUALITY：NEEDS_HUMAN，不自动重试；
-    - TIMEOUT：stop_tasks 批量释放资源；悬赏未过期且尚未重试过可重排队一次，否则
-      ABANDONED。
+    - TIMEOUT：先 stop_tasks 释放资源，**只有确认停止成功**才重排队/放弃；未确认时
+      留在 TIMEOUT 等下个 tick，累计 _MAX_STOP_ATTEMPTS 次仍未停下 → NEEDS_HUMAN。
+
+    每条记录单独 try/except：一条坏记录（如 config_params 无法解析）不能让整个失败
+    处理阶段每个 tick 都抛异常，把后面所有记录一起饿死。
     """
     now = now or datetime.now(timezone.utc)
 
@@ -101,7 +113,17 @@ def handle(storage: Storage, client: PlatformClient, settings: Settings,
                 True, f"{streak} consecutive engine failures; config template may be broken")
             logger.error("engine failure streak %d >= %d; kill switch ON", streak, _STREAK_LIMIT)
     for rec in engine_failed:
-        new_cfg = next_config(rec) if rec.retry_count < settings.max_retries else None
+        try:
+            new_cfg = next_config(rec) if rec.retry_count < settings.max_retries else None
+        except Exception:
+            # config_params 为空/非法 YAML（next_config 里 cfg["sut_config"] 会炸）。
+            # 这类记录无法自动调参，交给人；绝不能让它每个 tick 打断整批处理。
+            logger.exception(
+                "cannot derive next config for %s@%s (unparsable config_params); "
+                "marking NEEDS_HUMAN", rec.model_id, rec.target_gpu)
+            rec.status = TaskStatus.NEEDS_HUMAN
+            storage.update_task(rec)
+            continue
         if new_cfg is None:
             rec.status = TaskStatus.BLACKLISTED
             logger.warning("blacklisting %s@%s after %d retries",
@@ -119,16 +141,53 @@ def handle(storage: Storage, client: PlatformClient, settings: Settings,
         storage.update_task(rec)
 
     for rec in storage.tasks_by_status(TaskStatus.TIMEOUT):
-        if rec.task_id is not None:
-            try:
-                client.stop_tasks([rec.task_id])
-            except Exception:
-                logger.exception("stop_tasks failed for %s", rec.task_id)
-        if rec.bounty_deadline is not None and rec.bounty_deadline > now and rec.retry_count == 0:
-            rec.status = TaskStatus.QUEUED
-            rec.retry_count += 1
-            rec.task_id = None
-            rec.submit_time = None
-        else:
-            rec.status = TaskStatus.ABANDONED
-        storage.update_task(rec)
+        try:
+            _handle_timeout(storage, client, rec, now)
+        except Exception:
+            logger.exception("failed to handle timeout record %s@%s; left in TIMEOUT",
+                             rec.model_id, rec.target_gpu)
+
+
+def _handle_timeout(storage: Storage, client: PlatformClient, rec: TaskRecord,
+                    now: datetime) -> None:
+    """超时记录：确认平台侧任务已停止后，才允许重排队（悬赏）或放弃。
+
+    stop_tasks 返回 bool（附录 A.5）且可能抛异常。以前无论成败都直接重排队——
+    平台上那个任务可能还在跑，而我们又为同一 (model_id, target_gpu) 提交了一个新
+    任务，这正是平台判定"重复提交"并清空账号全部任务的场景。
+    """
+    if rec.task_id is not None:
+        try:
+            stopped = bool(client.stop_tasks([rec.task_id]))
+        except Exception as e:
+            escalate_if_credential_error(storage, e)
+            logger.exception("stop_tasks raised for task %s", rec.task_id)
+            stopped = False
+
+        if not stopped:
+            key = _stop_attempts_key(rec.task_id)
+            attempts = storage.get_counter(key) + 1
+            storage.set_counter(key, attempts)
+            if attempts >= _MAX_STOP_ATTEMPTS:
+                rec.status = TaskStatus.NEEDS_HUMAN
+                storage.update_task(rec)
+                logger.error(
+                    "stop_tasks did not land for task %s after %d attempts; marking "
+                    "%s@%s NEEDS_HUMAN (platform task may still be running)",
+                    rec.task_id, attempts, rec.model_id, rec.target_gpu)
+            else:
+                logger.error(
+                    "stop_tasks did not land for task %s (attempt %d/%d); leaving %s@%s "
+                    "in TIMEOUT — will not requeue while the platform task may still run",
+                    rec.task_id, attempts, _MAX_STOP_ATTEMPTS, rec.model_id, rec.target_gpu)
+            return
+
+    deadline = ensure_utc(rec.bounty_deadline)
+    if deadline is not None and deadline > now and rec.retry_count == 0:
+        rec.status = TaskStatus.QUEUED
+        rec.retry_count += 1
+        rec.task_id = None
+        rec.submit_time = None
+    else:
+        rec.status = TaskStatus.ABANDONED
+    storage.update_task(rec)

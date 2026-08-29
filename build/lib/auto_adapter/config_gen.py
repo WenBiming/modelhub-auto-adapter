@@ -8,6 +8,26 @@ from . import rules
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
+# v0.1 只允许提交 vllm 候选（理由见 build_request）。
+SUPPORTED_FRAMEWORKS = ("vllm",)
+
+
+class UnresolvableCandidateError(ValueError):
+    """候选无法自动组装成一次可信的提交：调用方必须落 NEEDS_HUMAN 记录，绝不盲提。
+
+    `reason` 同时用作 metrics 计数名：
+    - "unresolvable_task_type"：taskType 推不出来（spec §4.4）；
+    - "unsupported_framework"：解析出的框架不在 v0.1 支持列表内。
+
+    继承 ValueError 只为兼容既有调用方；调用方应捕获本类型而非裸 ValueError——
+    模板格式化本身抛出的 ValueError 是另一回事，不能被算成"无法解析的候选"。
+    """
+
+    def __init__(self, reason: str, message: str, framework: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.framework = framework
+
 
 def resolve_task_type(candidate) -> str | None:
     """pipeline_tag 直映射；缺失时查 rules.FALLBACK_TASK_TYPE_RULES；
@@ -51,7 +71,14 @@ def resolve_framework(candidate) -> str:
 
 
 def select_target_gpu(storage) -> str:
-    """选平台覆盖率最低的 GPU 型号（覆盖率缓存于 storage）。"""
+    """选平台覆盖率最低的 GPU 型号（覆盖率缓存于 storage，由 eligibility 写入）。
+
+    v0.1 的实际效果：rules.KNOWN_GPUS 只有一个已确认型号，所以这里恒返回它。
+    扩充 KNOWN_GPUS（spec §9 上线前人工步骤）后本函数立即开始按覆盖率分流。
+    注意候选的 processed 标记按 model_id 记（不含 GPU）：一个模型在一段时间内只会
+    被适配到一张卡上，多卡覆盖靠不同模型分流实现，而不是同一模型逐卡重复提交——
+    这是防重复提交的保守取舍，要改成"每模型每卡各一次"必须同时改候选表主键。
+    """
     coverage = storage.gpu_coverage()
     return min(rules.KNOWN_GPUS, key=lambda g: coverage.get(g, 0))
 
@@ -65,11 +92,25 @@ def render_config_params(framework: str, tp_size: int, max_model_len: int = 4096
 
 
 def build_request(candidate, target_gpu, strategy_id):
-    """组装完整请求体：上述推导结果 + render_config_params。"""
+    """组装完整请求体：上述推导结果 + render_config_params。
+
+    无法可信组装时抛 UnresolvableCandidateError，调用方落 NEEDS_HUMAN 记录。
+    """
     task_type = resolve_task_type(candidate)
     if task_type is None:
-        raise ValueError(f"cannot resolve task type for {candidate.model_id}")
+        raise UnresolvableCandidateError(
+            "unresolvable_task_type", f"cannot resolve task type for {candidate.model_id}")
     framework = resolve_framework(candidate)
+    if framework not in SUPPORTED_FRAMEWORKS:
+        # v0.1 不提交非 vllm 候选：templates/transformers.yaml 的 command 字段是显式
+        # 占位符（"待平台确认"），而失败重试梯子只会调 tp/显存/上下文长度，改不了一条
+        # 错误的启动命令——这类候选只会白烧 3 次提交然后被永久拉黑，还平白增加平台
+        # 侧的重复提交风险。等平台确认真实框架列表与启动命令后解除（spec §9）。
+        raise UnresolvableCandidateError(
+            "unsupported_framework",
+            f"framework {framework!r} is not submittable in v0.1 "
+            f"(only {SUPPORTED_FRAMEWORKS}); {candidate.model_id} needs human review",
+            framework=framework)
     config = render_config_params(framework, resolve_tp_size(candidate.params_size))
     from .models import AddTaskRequest
     return AddTaskRequest(

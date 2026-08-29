@@ -7,8 +7,12 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from .models import AddTaskRequest, TaskStatus
-from .platform_client import PlatformClient, PlatformClientError
+from .models import AddTaskRequest, TaskStatus, ensure_utc
+from .platform_client import (
+    PlatformClient,
+    PlatformClientError,
+    escalate_if_credential_error,
+)
 from .settings import Settings
 from .storage import Storage
 
@@ -24,22 +28,28 @@ def drain(storage: Storage, client: PlatformClient, settings: Settings, now: dat
     - 排序键 (priority, bounty_deadline, model_id)；
     - 令牌桶：max_submits_per_minute；在途 (PENDING+RUNNING) ≥ max_inflight 时停止；
     - 悬赏剩余时间 < 预估适配时长×2 仍未提交 → 标记 ABANDONED 并告警；
-    - 成功：写回 task_id/submit_time/status=PENDING；失败：保持 QUEUED 记录原因。
+    - 成功：写回 task_id/submit_time/status=PENDING；
+    - 平台明确拒绝（业务码非 50000/50001）：退回 QUEUED，下个 tick 重试；
+    - 结果不可知（传输层异常/HTTPError/50000/50001）：留在 PENDING + task_id=None，
+      由 monitor 对账（宁漏勿重，绝不重复提交）。
 
-    Safety: Mark PENDING before network call, revert on failure, set kill_switch on update_task failure.
+    Safety: Mark PENDING before network call, revert ONLY on definite rejection,
+    set kill_switch on update_task failure.
     """
     now = now or datetime.now(timezone.utc)
     if storage.kill_switch():
         logger.warning("kill switch on; submission paused")
         return 0
 
+    # 排序键里的 deadline 也要归一化：naive 与 aware 混排会在比较时抛 TypeError。
     queued = sorted(storage.tasks_by_status(TaskStatus.QUEUED),
-                    key=lambda r: (r.priority, r.bounty_deadline or _MAX_DT, r.model_id))
+                    key=lambda r: (r.priority, ensure_utc(r.bounty_deadline) or _MAX_DT, r.model_id))
 
     # First pass: mark expiring bounties as ABANDONED (independent of budget)
     for record in queued:
-        if record.bounty_deadline is not None and \
-                record.bounty_deadline - now < timedelta(hours=2 * EST_ADAPT_HOURS):
+        deadline = ensure_utc(record.bounty_deadline)
+        if deadline is not None and \
+                deadline - now < timedelta(hours=2 * EST_ADAPT_HOURS):
             record.status = TaskStatus.ABANDONED
             storage.update_task(record)
             logger.warning("bounty %s abandoned: deadline too close", record.model_id)
@@ -82,7 +92,18 @@ def drain(storage: Storage, client: PlatformClient, settings: Settings, now: dat
         try:
             record.task_id = client.add_task(req)
         except PlatformClientError as e:
-            # Revert to QUEUED on platform error
+            if e.is_transient:
+                # 50000/50001：平台内部异常，任务是否已建单不可知。退回 QUEUED 会在
+                # 下个 tick 对同一 (model_id, target_gpu) 再提交一次——平台一旦判定
+                # 重复提交会清空账号全部任务。留在 PENDING + task_id=None（Task 7 的
+                # 安全态，monitor.poll 会用 modelId/gpuType 去平台列表里认领回来）。
+                logger.error(
+                    "submit outcome UNKNOWN for %s (transient platform error %s); "
+                    "record left PENDING with task_id=None for reconciliation",
+                    record.model_id, e)
+                continue
+
+            # 明确拒绝（40100/40101/40400 等业务码）：平台没有建单，退回 QUEUED 安全。
             record.status = TaskStatus.QUEUED
             record.submit_time = None
             try:
@@ -90,20 +111,16 @@ def drain(storage: Storage, client: PlatformClient, settings: Settings, now: dat
             except Exception:
                 logger.error("failed to revert %s to QUEUED after PlatformClientError", record.model_id)
 
-            if e.is_credential_error:
-                storage.set_kill_switch(True, str(e))
+            if escalate_if_credential_error(storage, e):
                 return submitted
             logger.warning("submit failed for %s: %s", record.model_id, e)
             continue
         except Exception:
-            # Revert to QUEUED on any other error
-            record.status = TaskStatus.QUEUED
-            record.submit_time = None
-            try:
-                storage.update_task(record)
-            except Exception:
-                logger.error("failed to revert %s to QUEUED after exception", record.model_id)
-            logger.exception("submit failed for %s", record.model_id)
+            # 传输层异常（ReadTimeout/ConnectionError）与 HTTPError：请求可能已经
+            # 到达平台并建单，只是响应没回来。结果不可知 → 同样留在 PENDING。
+            logger.error(
+                "submit outcome UNKNOWN for %s (transport/HTTP error); record left PENDING "
+                "with task_id=None for reconciliation", record.model_id, exc_info=True)
             continue
 
         # Persist task_id after successful submission
