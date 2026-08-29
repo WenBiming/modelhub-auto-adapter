@@ -26,5 +26,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# configParams 模板必须随 wheel 一起安装：容器用 `pip install .`（非 editable 安装），
+# 缺了这一节 config_gen.render_config_params 会在生产环境第一次渲染时抛
+# FileNotFoundError，整条流水线在 submitter 之前就中断（tests/test_packaging.py 守护）。
+[tool.setuptools.package-data]
+auto_adapter = ["templates/*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
