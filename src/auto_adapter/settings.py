@@ -16,6 +16,8 @@ class Settings:
     max_inflight: int = 5
     max_retries: int = 3
     task_timeout_hours: int = 6
+    bounty_config_path: str = ""
+    hf_fetch_limit: int = 50
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -33,4 +35,6 @@ class Settings:
             task_timeout_hours=int(
                 os.environ.get("TASK_TIMEOUT_HOURS", cls.task_timeout_hours)
             ),
+            bounty_config_path=os.environ.get("BOUNTY_CONFIG_PATH", cls.bounty_config_path),
+            hf_fetch_limit=int(os.environ.get("HF_FETCH_LIMIT", cls.hf_fetch_limit)),
         )
