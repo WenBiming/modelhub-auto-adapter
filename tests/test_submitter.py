@@ -71,3 +71,73 @@ def test_expiring_bounty_abandoned(store):
     store.insert_task(_queued("org/late", Priority.BOUNTY, NOW + timedelta(hours=1)))
     assert submitter.drain(store, Mock(), SETTINGS, now=NOW) == 0
     assert store.tasks_by_status(TaskStatus.ABANDONED)[0].model_id == "org/late"
+
+
+def test_post_submit_update_failure_sets_kill_switch(store):
+    """Safety property FIX 1: if update_task fails after successful submission,
+    kill_switch is set to prevent resubmission. Record is NOT left in QUEUED.
+    (task_id not persisted due to storage failure, but kill_switch blocks resubmission and
+    task_id is logged for manual reconciliation)"""
+    store.insert_task(_queued("org/risky"))
+    client = Mock()
+    client.add_task.return_value = 999
+
+    original_update = store.update_task
+    call_count = [0]
+    def failing_update(rec):
+        call_count[0] += 1
+        if call_count[0] == 2:  # Second call (after successful add_task) fails
+            raise RuntimeError("storage error")
+        return original_update(rec)
+
+    store.update_task = failing_update
+
+    # drain should count it as submitted (add_task succeeded)
+    assert submitter.drain(store, client, SETTINGS, now=NOW) == 1
+    # kill_switch must be on to prevent resubmission (most critical safety property)
+    assert store.kill_switch() is True
+    # record must NOT be in QUEUED (it's in PENDING, preventing resubmission)
+    queued = store.tasks_by_status(TaskStatus.QUEUED)
+    assert len(queued) == 0
+    pending = store.tasks_by_status(TaskStatus.PENDING)
+    assert pending[0].model_id == "org/risky"
+    # task_id not persisted (storage failed), but kill_switch+logs allow manual reconciliation
+
+
+def test_client_error_reverts_to_queued(store):
+    """Safety property FIX 1: if add_task fails (non-credential), record reverts to QUEUED
+    so it can be resubmitted next tick."""
+    store.insert_task(_queued("org/retry"))
+    client = Mock()
+    client.add_task.side_effect = PlatformClientError(500, "server error")
+
+    assert submitter.drain(store, client, SETTINGS, now=NOW) == 0
+    # Record must be reverted to QUEUED, not left in PENDING
+    queued = store.tasks_by_status(TaskStatus.QUEUED)
+    assert queued[0].model_id == "org/retry"
+    assert queued[0].submit_time is None
+    assert queued[0].task_id is None
+    # kill_switch should NOT be set (non-credential error)
+    assert store.kill_switch() is False
+
+
+def test_expiring_bounty_abandoned_regardless_of_budget(store):
+    """Safety property FIX 2: expiring bounties are marked ABANDONED even when
+    in-flight is at max_inflight (independent of budget constraint)."""
+    # Fill in-flight to max_inflight=3
+    for i in range(3):
+        rec = _queued(f"org/running{i}")
+        rec.status = TaskStatus.RUNNING
+        store.insert_task(rec)
+
+    # Add an expiring bounty
+    store.insert_task(_queued("org/expiring", Priority.BOUNTY, NOW + timedelta(hours=1)))
+
+    client = Mock()
+    result = submitter.drain(store, client, SETTINGS, now=NOW)
+
+    # No submissions (budget=0) but bounty is abandoned
+    assert result == 0
+    abandoned = store.tasks_by_status(TaskStatus.ABANDONED)
+    assert len(abandoned) == 1
+    assert abandoned[0].model_id == "org/expiring"
