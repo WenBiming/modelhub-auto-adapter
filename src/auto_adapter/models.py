@@ -64,6 +64,8 @@ class TaskRecord:
     retry_count: int = 0
     submit_time: datetime | None = None
     bounty_deadline: datetime | None = None
+    model_url: str = ""
+    task_type: str = ""
     last_log: str | None = None
 
 
