@@ -39,12 +39,27 @@ class PlatformClient:
         self._session = requests.Session()
         self._session.headers["Xc-Token"] = xc_token
 
+    def _request(self, method: str, path: str, *, params=None, json_body=None):
+        resp = self._session.request(
+            method, self._base_url + path,
+            params=params, json=json_body, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != CODE_OK:
+            raise PlatformClientError(body.get("code", -1), body.get("message", ""))
+        return body.get("data")
+
     def add_task(self, req: AddTaskRequest) -> int:
         """POST /api/adapt/task/add → AsyncTaskVO.id（int64）。
 
         请求体字段转 camelCase；configParams 为 YAML 字符串（附录 A.1.1）。
         """
-        raise NotImplementedError
+        data = self._request("POST", "/api/adapt/task/add", json_body={
+            "modelAddress": req.model_address, "taskType": req.task_type,
+            "targetGpu": req.target_gpu, "framework": req.framework,
+            "configParams": req.config_params, "strategyId": req.strategy_id,
+        })
+        return int(data["id"])
 
     def list_my_tasks(self, current: int = 1, page_size: int = 50, **filters) -> dict:
         """GET /api/adapt/task/page，固定 onlyMine=true。
@@ -52,11 +67,12 @@ class PlatformClient:
         返回 Page<AsyncModelVerifyTaskVO>（附录 A.3）；filters 支持
         modelId/gpuType/status/stage/verifyResult/taskId 等。
         """
-        raise NotImplementedError
+        params = {"current": current, "pageSize": page_size, "onlyMine": "true", **filters}
+        return self._request("GET", "/api/adapt/task/page", params=params)
 
     def get_task_log(self, task_id: int) -> str:
         """GET /api/adapt/task/log?taskId=... → 日志全文（data: string）。"""
-        raise NotImplementedError
+        return self._request("GET", "/api/adapt/task/log", params={"taskId": task_id})
 
     def search_model(self, model_id: str) -> ModelSearchResult:
         """GET /api/computility/models/search-by-model-id?modelId=...
@@ -64,13 +80,15 @@ class PlatformClient:
         去重准入的平台侧依据：verify_result 按 GPU 型号分键（附录 A.4）。
         调用方在此接口失败时必须保守跳过（宁漏勿重）。
         """
-        raise NotImplementedError
+        data = self._request("GET", "/api/computility/models/search-by-model-id",
+                             params={"modelId": model_id})
+        return ModelSearchResult(
+            is_in_db=bool(data.get("isInDB")),
+            model_info=data.get("modelInfo") or {},
+            verify_result=data.get("verifyResult") or {},
+        )
 
     def stop_tasks(self, task_ids: list[int]) -> bool:
         """PUT /api/async/task/stop-create-contest-task，批量终止（附录 A.5）。"""
-        raise NotImplementedError
-
-    def list_bounties(self) -> list[dict]:
-        """悬赏列表。开放平台 API 文档无此接口（spec §9）：
-        需改为爬取「模型适配挑战」页面或读取人工配置列表。"""
-        raise NotImplementedError
+        return bool(self._request("PUT", "/api/async/task/stop-create-contest-task",
+                                  json_body={"taskIds": task_ids}))

@@ -1,6 +1,6 @@
 """平台悬赏列表发现源——优先级最高，每 tick 执行。M3 实现。
 
-依赖 platform_client.list_bounties()（真实 API 路径待确认，spec §9）。
+待实现（真实 API 路径待确认，spec §9）。
 """
 from __future__ import annotations
 
