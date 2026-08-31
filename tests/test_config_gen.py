@@ -113,3 +113,13 @@ def test_select_target_gpu_picks_least_covered_among_all(tmp_path):
     # 除 hygon_k100-ai 外都有覆盖 → 应选中它
     store.set_gpu_coverage({g: 5 for g in rules.KNOWN_GPUS if g != "hygon_k100-ai"})
     assert config_gen.select_target_gpu(store) == "hygon_k100-ai"
+
+
+def test_rendered_config_has_no_developer_comments():
+    """开发注释随 configParams 发给平台没有意义；而且注释里的占位符也会被 format
+    替换，线上演练里出现过 "# 占位符 2/4096/0.9" 这种被替换过的残句。"""
+    text = config_gen.render_config_params("vllm", tp_size=2)
+    assert "#" not in text
+    assert "占位符" not in text
+    cfg = yaml.safe_load(text)  # 剥注释后仍是合法 YAML
+    assert cfg["framework"] == "vllm" and cfg["sut_config"]["gpu_num"] == 2

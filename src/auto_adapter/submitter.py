@@ -80,13 +80,16 @@ def drain(storage: Storage, client: PlatformClient, settings: Settings, now: dat
             # 会在平台侧找不到它而误判"任务被清理"并拉闸。
             # 每个 (model_id, target_gpu) 只详细打印一次，避免每分钟刷屏。
             key = f"dryrun_logged:{record.model_id}@{record.target_gpu}"
-            if not storage.get_counter(key):
-                storage.set_counter(key, 1)
-                logger.info("DRY RUN would submit: %s", json.dumps({
-                    "modelAddress": req.model_address, "taskType": req.task_type,
-                    "targetGpu": req.target_gpu, "framework": req.framework,
-                    "strategyId": req.strategy_id, "configParams": req.config_params,
-                }, ensure_ascii=False))
+            if storage.get_counter(key):
+                # 已经报告过：不占预算，直接看下一条。否则记录一直是 QUEUED，
+                # 每个 tick 都排到同样的前两条，队列后面的永远看不到。
+                continue
+            storage.set_counter(key, 1)
+            logger.info("DRY RUN would submit: %s", json.dumps({
+                "modelAddress": req.model_address, "taskType": req.task_type,
+                "targetGpu": req.target_gpu, "framework": req.framework,
+                "strategyId": req.strategy_id, "configParams": req.config_params,
+            }, ensure_ascii=False))
             submitted += 1  # 占用限流预算，让演练的节奏与真实运行一致
             continue
 

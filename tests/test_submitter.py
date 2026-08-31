@@ -307,3 +307,20 @@ def test_dry_run_logs_the_intended_request_once(store, caplog):
     assert first == 1
     assert second == 1  # 同一 (model_id, target_gpu) 不再刷屏
     assert "org/a" in caplog.text
+
+
+def test_dry_run_advances_through_the_queue_across_ticks(store):
+    """演练时记录保持 QUEUED，若已报告过的仍占预算，每个 tick 都会排到同样的前两条，
+    队列后面的永远看不到——演练也就只能看到冰山一角。"""
+    for i in range(5):
+        store.insert_task(_queued(f"org/m{i}"))
+    client = Mock()
+
+    seen = []
+    for _ in range(3):
+        submitter.drain(store, client, DRY_SETTINGS, now=NOW)
+        seen.append(sum(1 for i in range(5)
+                        if store.get_counter(f"dryrun_logged:org/m{i}@MetaX_c-500")))
+
+    assert seen == [2, 4, 5]  # 每轮推进 2 条（限流），第三轮收尾
+    client.add_task.assert_not_called()

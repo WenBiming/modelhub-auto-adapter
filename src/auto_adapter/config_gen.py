@@ -90,10 +90,17 @@ def select_target_gpu(storage, exclude: set[str] | None = None) -> str | None:
 
 def render_config_params(framework: str, tp_size: int, max_model_len: int = 4096,
                          gpu_mem_util: float = 0.9) -> str:
-    """渲染 templates/{framework}.yaml 为 configParams YAML 字符串（spec 附录 A.1.1）。"""
+    """渲染 templates/{framework}.yaml 为 configParams YAML 字符串（spec 附录 A.1.1）。
+
+    模板顶部的开发注释会被剥掉：它们随 configParams 一起发给平台没有意义，而且
+    注释里写的占位符也会被 str.format 一并替换（线上演练里看到 "# 占位符 2/4096/0.9"
+    这种被替换过的残句）。只去掉整行注释，行内的 YAML 值不受影响。
+    """
     template = (_TEMPLATE_DIR / f"{framework}.yaml").read_text()
-    return template.format(tp_size=tp_size, max_model_len=max_model_len,
-                           gpu_mem_util=gpu_mem_util)
+    body = "\n".join(line for line in template.splitlines()
+                     if not line.lstrip().startswith("#"))
+    return body.format(tp_size=tp_size, max_model_len=max_model_len,
+                       gpu_mem_util=gpu_mem_util) + "\n"
 
 
 def build_request(candidate, target_gpu, strategy_id):
