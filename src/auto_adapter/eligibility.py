@@ -70,6 +70,8 @@ def evaluate(
 
     _record_gpu_coverage(storage, result.verify_result)
 
+    logger.info("platform coverage for %s: %s",
+                candidate.model_id, sorted(result.verify_result.keys()) or "(none)")
     if target_gpu in result.verify_result:
         # GpuVerifyResult 内部字段未确认前，键存在即视为已覆盖（保守）
         return Decision(Verdict.SKIP_DUPLICATE, reason=f"already verified on {target_gpu}")

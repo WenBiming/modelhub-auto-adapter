@@ -24,6 +24,21 @@ logger = logging.getLogger(__name__)
 MAX_PAGES = 20
 
 
+def _as_int(raw, default: int = 0) -> int:
+    """平台把 int64 字段序列化成 **字符串**（实测：taskId "33260"、creatorId "64"、
+    machineId "8"），int32 字段（verifyResult）才是真数字——典型的 Java 防 JS 精度
+    丢失做法，附录 A.3 里标 int64 的字段都要按这个处理。
+
+    不统一转换会踩两个坑：分页比较 `int < str` 直接抛 TypeError（线上实测），
+    以及 platform_rows 用字符串键、本地 task_id 是 int，`.get()` 永远匹配不上——
+    每个在途任务都会被判成"平台侧消失"，触发最高级别的熔断误报。
+    """
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _fetch_platform_rows(
     client: PlatformClient,
     storage: Storage | None = None,
@@ -44,8 +59,8 @@ def _fetch_platform_rows(
     """
     page = client.list_my_tasks(current=1, page_size=100)  # 第一页异常向上抛出
     rows = page.get("records", [])
-    platform_rows: dict[int, dict] = {row["taskId"]: row for row in rows}
-    total_pages = page.get("pages", 1)
+    platform_rows: dict[int, dict] = {_as_int(row.get("taskId")): row for row in rows}
+    total_pages = _as_int(page.get("pages"), 1)
     pages_read = 1
 
     while rows and pages_read < total_pages:
@@ -72,7 +87,7 @@ def _fetch_platform_rows(
             return platform_rows, "failed"
         rows = page.get("records", [])
         for row in rows:
-            platform_rows[row["taskId"]] = row
+            platform_rows[_as_int(row.get("taskId"))] = row
         pages_read += 1
 
     return platform_rows, "complete"
@@ -117,7 +132,8 @@ def _match_orphan(rec: TaskRecord, platform_rows: dict[int, dict]) -> dict | Non
                if row.get("modelId") == rec.model_id and row.get("gpuType") == rec.target_gpu]
     if not matches:
         return None
-    return max(matches, key=lambda r: r.get("taskId", 0))
+    # 按 taskId 数值取最新一条：字符串排序会把 "9" 排在 "10" 后面。
+    return max(matches, key=lambda r: _as_int(r.get("taskId")))
 
 
 def poll(storage: Storage, client: PlatformClient, settings: Settings,
@@ -174,7 +190,7 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
             continue
         row = _match_orphan(rec, platform_rows)
         if row is not None:
-            rec.task_id = int(row["taskId"])
+            rec.task_id = _as_int(row.get("taskId"))
             storage.update_task(rec)
             logger.warning(
                 "reattached orphan record %s@%s to platform task %s (submit outcome was "
@@ -272,7 +288,7 @@ def adopt_orphaned_platform_tasks(storage: Storage, client: PlatformClient) -> i
 
     adopted = 0
     for task_id, row in platform_rows.items():
-        mapped = rules.map_platform_result(row.get("status"), row.get("verifyResult"))
+        mapped = rules.map_platform_result(row.get("status"), _as_int(row.get("verifyResult")))
         if mapped not in (TaskStatus.PENDING, TaskStatus.RUNNING):
             continue  # 只认领在途任务；已完成的靠 search_model 去重
         model_id, gpu = row.get("modelId"), row.get("gpuType")
@@ -284,7 +300,7 @@ def adopt_orphaned_platform_tasks(storage: Storage, client: PlatformClient) -> i
             storage.insert_task(TaskRecord(
                 model_id=model_id, target_gpu=gpu,
                 framework="", status=mapped, priority=Priority.NEW_ADAPTATION,
-                task_id=int(task_id),
+                task_id=_as_int(task_id),
                 submit_time=_parse_platform_time(row.get("updateTime")),
                 model_url="", task_type=""))
             adopted += 1

@@ -461,3 +461,50 @@ def test_adoption_does_not_clobber_existing_local_records(store):
 
     assert monitor.adopt_orphaned_platform_tasks(store, client) == 0
     assert store.get_task("org/a", "MetaX_c-500").task_id == 999  # 本地记录优先
+
+
+def test_platform_int64_fields_arrive_as_strings(store):
+    """平台把 int64 字段序列化成字符串（实测 taskId "33260"），int32 的 verifyResult
+    才是真数字。不统一转换会踩两个坑：分页比较 int < str 直接抛 TypeError；
+    以及 platform_rows 用字符串键、本地 task_id 是 int，永远匹配不上——每个在途任务
+    都会被判成"平台侧消失"，触发最高级别的熔断误报。"""
+    store.insert_task(_pending("org/a", 33260))
+    client = Mock()
+    client.list_my_tasks.return_value = {
+        "records": [{"taskId": "33260", "modelId": "org/a", "gpuType": "MetaX_c-500",
+                     "status": "running", "verifyResult": 1}],
+        "total": "1", "current": "1", "pages": "1", "size": "100"}
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.status == TaskStatus.RUNNING      # 认出来了，没被判死
+    assert store.kill_switch() is False          # 没有误报"平台侧消失"
+
+
+def test_string_pages_do_not_break_pagination(store):
+    """线上实测的报错：'<' not supported between instances of 'int' and 'str'。"""
+    store.insert_task(_pending("org/a", 1))
+    pages = {
+        1: {"records": [{"taskId": "9", "modelId": "org/x", "gpuType": "g",
+                         "status": "running", "verifyResult": 1}],
+            "pages": "2", "current": "1"},
+        2: {"records": [{"taskId": "1", "modelId": "org/a", "gpuType": "MetaX_c-500",
+                         "status": "success", "verifyResult": 1}],
+            "pages": "2", "current": "2"},
+    }
+    client = Mock()
+    client.list_my_tasks.side_effect = lambda current=1, **kw: pages[current]
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.SUCCESS
+    assert client.list_my_tasks.call_count == 2  # 两页都读到了
+
+
+def test_orphan_match_picks_numerically_latest_task_id(store):
+    """字符串排序会把 "9" 排在 "10" 之后，认领到的就成了旧任务。"""
+    rows = {9: {"taskId": "9", "modelId": "org/a", "gpuType": "MetaX_c-500"},
+            10: {"taskId": "10", "modelId": "org/a", "gpuType": "MetaX_c-500"}}
+    rec = _pending("org/a", None)
+    assert monitor._match_orphan(rec, rows)["taskId"] == "10"
