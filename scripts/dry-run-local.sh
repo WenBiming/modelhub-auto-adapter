@@ -32,7 +32,19 @@ unset XC_TOKEN
 
 echo "已启动，观察 ${MINUTES} 分钟（Ctrl-C 可提前结束）..."
 echo "----------------------------------------------------------------"
-timeout "$((MINUTES * 60))" docker logs -f "$NAME" 2>&1 \
-  | grep -Ev "werkzeug|Serving Flask|Debug mode|Running on|WARNING: This|Press CTRL" || true
+
+# 不用 timeout：macOS 自带的 BSD 工具集里没有它（那是 GNU coreutils）。
+# 改为后台跟随日志 + 到点 docker stop：容器收到真实 SIGTERM 优雅退出后，
+# docker logs -f 自然结束——顺便把停机路径也验了。
+( docker logs -f "$NAME" 2>&1 \
+    | grep -Ev "werkzeug|Serving Flask|Debug mode|Running on|WARNING: This|Press CTRL" ) &
+
+sleep "$((MINUTES * 60))"
 echo "----------------------------------------------------------------"
+echo "发送 SIGTERM，等待优雅停机..."
+START=$(date +%s)
+docker stop -t 35 "$NAME" >/dev/null 2>&1 || true
+echo "退出码 $(docker inspect "$NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo '?')"\
+     "，耗时 $(( $(date +%s) - START ))s（平台给 30s 宽限）"
+wait 2>/dev/null || true
 echo "结束。容器已清理。"
