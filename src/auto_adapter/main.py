@@ -90,7 +90,7 @@ def main() -> None:
     # 存储打不开（平台未挂卷、路径不可写）同样不能崩：崩了只剩重启循环，
     # 平台三次后标记失败，运维看不到 "unable to open database file" 之外的线索。
     try:
-        deps = build_deps(settings)
+        deps = build_deps(settings, stop_event)
     except StorageUnavailableError as e:
         health.set_state(status="storage-unavailable", config_error=str(e))
         logger.error("storage unavailable: %s", e)
@@ -150,7 +150,7 @@ class Deps:
     sources: list = field(default_factory=list)
 
 
-def build_deps(settings: Settings) -> Deps:
+def build_deps(settings: Settings, stop_event=None) -> Deps:
     """构造 storage/client/sources（spec §2）。
 
     悬赏源固定在前：discovery.run 对同一 model_id 的重复候选保留悬赏版本
@@ -162,7 +162,8 @@ def build_deps(settings: Settings) -> Deps:
     if settings.modelscope_discovery_enabled:
         # 平台内网连不上 huggingface.co，ModelScope 是那里唯一可达的模型源。
         sources.append(ModelScopeSource(storage, limit=settings.hf_fetch_limit,
-                                       task_types=settings.discovery_task_types))
+                                       task_types=settings.discovery_task_types,
+                                       stop_event=stop_event))
     if settings.hf_discovery_enabled:
         # storage 注入：1h 节流时间戳必须落盘，否则崩溃重启循环会每次重启
         # 都打一遍上游（CLAUDE.md：禁止业务模块自建内存态）。

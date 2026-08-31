@@ -19,6 +19,7 @@ def test_sigterm_exits_within_grace_period(tmp_path):
         "STORAGE_PATH": str(tmp_path / "agent.db"),
         "TICK_SECONDS": "60",
         "HF_DISCOVERY_ENABLED": "false",
+        "MODELSCOPE_DISCOVERY_ENABLED": "false",
     }
     proc = subprocess.Popen(
         [sys.executable, "-c", "from auto_adapter.main import main; main()"], env=env)

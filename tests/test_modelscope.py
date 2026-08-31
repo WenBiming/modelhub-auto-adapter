@@ -133,3 +133,22 @@ def test_gguf_models_are_filtered_out(tmp_path):
     ))
     store = SqliteStorage(str(tmp_path / "t.db"))
     assert [c.model_id for c in ModelScopeSource(store).fetch()] == ["org/plain-7B"]
+
+
+@responses.activate
+def test_pagination_stops_on_shutdown_signal(tmp_path):
+    """单页 10s 超时 × 5 页会超出平台 30s 的停机宽限期，超时后是 SIGKILL 而不是
+    优雅退出——这条是线上冒烟测试逼出来的（多页拉取当初漏了停机检查）。"""
+    import threading
+
+    full = _payload(*[_model("org", f"junk{i}", ["text-to-image-synthesis"], 1)
+                      for i in range(100)])
+    responses.put(_API, json=full)
+    stop = threading.Event()
+    stop.set()  # 第一页拉完前就已置位
+
+    store = SqliteStorage(str(tmp_path / "t.db"))
+    got = ModelScopeSource(store, limit=50, stop_event=stop).fetch()
+
+    assert got == []
+    assert len(responses.calls) == 0  # 一页都没打就退出了

@@ -15,7 +15,11 @@ class DiscoverySource(Protocol):
     name: str
 
     def fetch(self) -> list[CandidateModel]:
-        """拉取候选模型。实现自行负责节流（HF/MS 1h 一次，悬赏每 tick）。"""
+        """拉取候选模型。实现自行负责节流（HF/MS 1h 一次，悬赏每 tick）。
+
+        多页拉取的实现必须能被停机信号中断（stop_event 在构造时注入）：单页 10s
+        超时 × 多页会超出平台 30s 的宽限期，超时后是 SIGKILL，不是优雅退出。
+        """
         ...
 
 

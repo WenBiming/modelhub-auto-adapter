@@ -51,13 +51,15 @@ class ModelScopeSource:
     name = "modelscope"
 
     def __init__(self, storage, limit: int = 50, min_interval_seconds: int = 3600,
-                 task_types: tuple[str, ...] = ("text-generation",)) -> None:
+                 task_types: tuple[str, ...] = ("text-generation",),
+                 stop_event=None) -> None:
         # 节流时间戳落盘：容器崩溃重启循环时不能每次重启都再打一遍上游
         # （CLAUDE.md：禁止业务模块自建内存态）。
         self._storage = storage
         self._limit = limit
         self._min_interval = min_interval_seconds
         self._task_types = tuple(task_types)
+        self._stop_event = stop_event
 
     def _admits(self, item: dict) -> bool:
         """任务类型在配置内、且下载量过门槛。"""
@@ -74,6 +76,12 @@ class ModelScopeSource:
 
         models: list[dict] = []
         for page in range(1, _MAX_PAGES + 1):
+            if self._stop_event is not None and self._stop_event.is_set():
+                # 每页最坏 10s，翻满 5 页会超出平台 30s 的停机宽限期（之后是 SIGKILL）。
+                # 已拿到的页照常使用，剩下的留给下个 tick。
+                logger.warning("shutdown requested during modelscope pagination "
+                               "after %d page(s)", page - 1)
+                break
             resp = requests.put(_API, json={
                 "PageNumber": page, "PageSize": _FETCH_PAGE_SIZE,
                 "SortBy": _SORT_NEWEST, "Target": "", "SingleCriterion": [],
