@@ -103,6 +103,8 @@ class PlatformClient:
         self._base_url = base_url.rstrip("/")
         self._session = requests.Session()
         self._session.headers[AUTH_HEADER] = xc_token
+        # 官方 API 文档的调用示例带 Accept，照做以免在内容协商上出现差异。
+        self._session.headers["Accept"] = "application/json"
 
     def _request(self, method: str, path: str, *, params=None, json_body=None):
         resp = self._session.request(

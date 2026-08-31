@@ -110,3 +110,13 @@ def test_ordinary_http_error_is_not_a_credential_failure():
 
     assert escalate_if_credential_error(storage, exc) is False
     storage.set_kill_switch.assert_not_called()
+
+
+@responses.activate
+def test_sends_accept_json_like_the_documented_sample(client):
+    """官方 API 文档示例带 Accept: application/json，照做以免内容协商上出现差异。"""
+    responses.get(f"{BASE}/api/adapt/task/page",
+                  json={"code": 0, "message": "ok", "data": {"records": []}})
+    client.list_my_tasks()
+    assert responses.calls[0].request.headers["Accept"] == "application/json"
+    assert responses.calls[0].request.headers["Xc-Token"] == "tok"
