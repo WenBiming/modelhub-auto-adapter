@@ -43,19 +43,20 @@ def resolve_task_type(candidate) -> str | None:
     return None
 
 
+# 首次提交的并行度。恒为 1 是刻意的保守取值：gpu_num 同时意味着"向平台申请几张卡"，
+# 而各家算力机器的实际卡数我们并不知道。猜大了会因"机器没这么多卡"直接失败，
+# 而失败重试梯子的调整方向是**加大** tp——它修不好这类失败，只会越修越糟。
+# 反过来，猜小导致的 OOM 恰恰是梯子能修的（rung 2 会翻倍 tp）。
+# 代价：超大模型（>70B）首次几乎必然 OOM，要靠梯子爬上去。
+INITIAL_TP_SIZE = 1
+
+
 def resolve_tp_size(params_size: str | None) -> int:
-    """参数量 → tensor 并行度：<14B→1，14–70B→2，>70B→4；未知按 1。"""
-    if not params_size:
-        return 1
-    m = re.match(r"([\d.]+)\s*B", params_size, re.IGNORECASE)
-    if not m:
-        return 1
-    billions = float(m.group(1))
-    if billions < 14:
-        return 1
-    if billions <= 70:
-        return 2
-    return 4
+    """首次提交的 tensor 并行度：一律 1（见 INITIAL_TP_SIZE）。
+
+    参数量只作为日志线索保留，不再直接决定初始并行度。
+    """
+    return INITIAL_TP_SIZE
 
 
 def resolve_framework(candidate) -> str:

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 import requests
 
+from .. import rules
 from ..models import CandidateModel
 
 # 平台内网连不上 huggingface.co（线上实测 connect timeout）。HF_ENDPOINT 是 HF 生态
@@ -48,6 +49,9 @@ class HuggingFaceSource:
         for item in resp.json():
             model_id = item.get("modelId") or item.get("id")
             if not model_id:
+                continue
+            if not rules.passes_download_threshold(
+                    item.get("pipeline_tag"), item.get("downloads")):
                 continue
             m = _PARAMS_RE.search(model_id)
             out.append(CandidateModel(

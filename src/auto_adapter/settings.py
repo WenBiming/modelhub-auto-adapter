@@ -40,6 +40,10 @@ class Settings:
     hf_fetch_limit: int = 50
     hf_discovery_enabled: bool = True
     modelscope_discovery_enabled: bool = True
+    # v0.1 只提交 vllm（即 text-generation）。放开其他类型会让候选队列被无法提交的
+    # 模型占满——每个候选都要花一次平台 search_model（10s 超时），而单 tick 只评估
+    # 20 个。等平台确认了其他框架的启动命令再放开（spec §9）。
+    discovery_task_types: tuple[str, ...] = ("text-generation",)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -81,6 +85,9 @@ class Settings:
             hf_discovery_enabled=os.environ.get(
                 "HF_DISCOVERY_ENABLED", str(cls.hf_discovery_enabled)
             ).strip().lower() not in ("false", "0"),
+            discovery_task_types=tuple(
+                s.strip() for s in os.environ.get(
+                    "DISCOVERY_TASK_TYPES", "text-generation").split(",") if s.strip()),
             modelscope_discovery_enabled=os.environ.get(
                 "MODELSCOPE_DISCOVERY_ENABLED", str(cls.modelscope_discovery_enabled)
             ).strip().lower() not in ("false", "0"),

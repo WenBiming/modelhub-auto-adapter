@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 
 import requests
 
+from .. import rules
 from ..models import CandidateModel
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,9 @@ logger = logging.getLogger(__name__)
 _API = "https://www.modelscope.cn/api/v1/dolphin/models"
 _MODEL_URL = "https://www.modelscope.cn/models/{model_id}"
 _PARAMS_RE = re.compile(r"(\d+(?:\.\d+)?)[bB]\b")
-_TARGET_TASK = "text-generation"
+# 按发布时间倒序：新模型才是"平台从没见过"的那批（5 积分/个）；按下载量排序拿到的
+# 全是热门老模型，实测 17 个里 5 个所有可提交的卡都已适配、其余也只剩零星空位。
+_SORT_NEWEST = "GmtCreated"
 
 # 每次向 ModelScope 要多少条再客户端过滤。实测 100 条里约 17 条是 text-generation，
 # 取 200 是为了在 limit=50 时基本能填满，同时不至于一次拉太多。
@@ -42,12 +45,14 @@ _THROTTLE_KEY = "modelscope_last_fetch"
 class ModelScopeSource:
     name = "modelscope"
 
-    def __init__(self, storage, limit: int = 50, min_interval_seconds: int = 3600) -> None:
+    def __init__(self, storage, limit: int = 50, min_interval_seconds: int = 3600,
+                 task_types: tuple[str, ...] = ("text-generation",)) -> None:
         # 节流时间戳落盘：容器崩溃重启循环时不能每次重启都再打一遍上游
         # （CLAUDE.md：禁止业务模块自建内存态）。
         self._storage = storage
         self._limit = limit
         self._min_interval = min_interval_seconds
+        self._task_types = tuple(task_types)
 
     def fetch(self) -> list[CandidateModel]:
         now = int(time.time())
@@ -57,19 +62,24 @@ class ModelScopeSource:
 
         resp = requests.put(_API, json={
             "PageNumber": 1, "PageSize": _FETCH_PAGE_SIZE,
-            "SortBy": "DownloadsCount", "Target": "", "SingleCriterion": [],
+            "SortBy": _SORT_NEWEST, "Target": "", "SingleCriterion": [],
         }, timeout=10)
         resp.raise_for_status()
         models = (resp.json().get("Data") or {}).get("Model", {}).get("Models") or []
         self._storage.set_counter(_THROTTLE_KEY, now)
 
         out: list[CandidateModel] = []
+        below_threshold = 0
         for item in models:
             if len(out) >= self._limit:
                 break
             tasks = [t.get("Name") for t in (item.get("Tasks") or [])]
-            if _TARGET_TASK not in tasks:
-                continue  # v0.1 只提交 vllm 可跑的 text-generation
+            task_type = next((t for t in tasks if t in self._task_types), None)
+            if task_type is None:
+                continue
+            if not rules.passes_download_threshold(task_type, item.get("Downloads")):
+                below_threshold += 1
+                continue
             org, name = item.get("Path"), item.get("Name")
             if not org or not name:
                 continue
@@ -78,11 +88,11 @@ class ModelScopeSource:
             out.append(CandidateModel(
                 source="modelscope", model_id=model_id,
                 model_url=_MODEL_URL.format(model_id=model_id),
-                pipeline_tag=_TARGET_TASK,
+                pipeline_tag=task_type,
                 params_size=f"{m.group(1)}B" if m else None,
                 is_bounty=False, bounty_deadline=None,
                 discovered_at=datetime.now(timezone.utc),
             ))
-        logger.info("modelscope: %d text-generation candidates from %d models",
-                    len(out), len(models))
+        logger.info("modelscope: %d candidates from %d newest models "
+                    "(%d below the download threshold)", len(out), len(models), below_threshold)
         return out

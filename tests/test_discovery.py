@@ -13,8 +13,9 @@ from auto_adapter.storage.sqlite import SqliteStorage
 @responses.activate
 def test_huggingface_fetch_and_throttle(tmp_path):
     responses.get("https://huggingface.co/api/models", json=[
-        {"modelId": "Qwen/Qwen2.5-7B-Instruct", "pipeline_tag": "text-generation"},
-        {"id": "org/other-13B", "pipeline_tag": "text-generation"},
+        {"modelId": "Qwen/Qwen2.5-7B-Instruct", "pipeline_tag": "text-generation",
+         "downloads": 999},
+        {"id": "org/other-13B", "pipeline_tag": "text-generation", "downloads": 500},
     ])
     store = SqliteStorage(str(tmp_path / "t.db"))
     src = HuggingFaceSource(store, limit=2, min_interval_seconds=3600)
@@ -157,3 +158,18 @@ def test_run_counts_only_genuinely_new_candidates(tmp_path, candidate):
 
     store.mark_candidate_processed(candidate.model_id)
     assert run([Fake()], store) == 0  # already-known even after processing
+
+
+@responses.activate
+def test_huggingface_applies_download_thresholds():
+    """业务规则：text-generation 需 >50 下载量，其他类型 >5。
+    新发布的模型绝大多数是个人试验品，不设门槛会把验证算力浪费掉。"""
+    responses.get("https://huggingface.co/api/models", json=[
+        {"modelId": "org/popular", "pipeline_tag": "text-generation", "downloads": 51},
+        {"modelId": "org/niche", "pipeline_tag": "text-generation", "downloads": 50},
+        {"modelId": "org/unknown-downloads", "pipeline_tag": "text-generation"},
+    ])
+    store = SqliteStorage(":memory:")
+    got = HuggingFaceSource(store, limit=10).fetch()
+    # 边界是"大于"：50 不通过，51 通过；下载量缺失一律不通过
+    assert [c.model_id for c in got] == ["org/popular"]

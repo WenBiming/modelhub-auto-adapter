@@ -11,7 +11,7 @@ def _payload(*models):
     return {"Data": {"Model": {"Models": list(models)}, "TotalCount": len(models)}}
 
 
-def _model(org, name, tasks, downloads=100):
+def _model(org, name, tasks, downloads=1000):
     return {"Path": org, "Name": name, "Downloads": downloads,
             "Tasks": [{"Name": t} for t in tasks]}
 
@@ -53,3 +53,44 @@ def test_limit_is_respected(tmp_path):
         *[_model("org", f"m{i}-7B", ["text-generation"]) for i in range(10)]))
     store = SqliteStorage(str(tmp_path / "t.db"))
     assert len(ModelScopeSource(store, limit=3).fetch()) == 3
+
+
+@responses.activate
+def test_applies_download_thresholds_per_task_type(tmp_path):
+    """text-generation >50，其他类型 >5（业务规则）。"""
+    responses.put(_API, json=_payload(
+        _model("org", "textgen-ok", ["text-generation"], downloads=51),
+        _model("org", "textgen-too-few", ["text-generation"], downloads=50),
+        _model("org", "image-ok", ["text-to-image-synthesis"], downloads=6),
+        _model("org", "image-too-few", ["text-to-image-synthesis"], downloads=5),
+    ))
+    store = SqliteStorage(str(tmp_path / "t.db"))
+    src = ModelScopeSource(store, task_types=("text-generation", "text-to-image-synthesis"))
+
+    got = src.fetch()
+
+    assert [c.model_id for c in got] == ["org/textgen-ok", "org/image-ok"]
+    assert got[1].pipeline_tag == "text-to-image-synthesis"
+
+
+@responses.activate
+def test_sorts_by_newest_not_by_downloads(tmp_path):
+    """新模型才是"平台从没见过"的那批（5 积分/个）；按下载量排只会拿到热门老模型，
+    实测那批里多数卡位都已被适配。"""
+    responses.put(_API, json=_payload(_model("org", "new-7B", ["text-generation"], 999)))
+    ModelScopeSource(SqliteStorage(str(tmp_path / "t.db"))).fetch()
+    import json as _json
+    assert _json.loads(responses.calls[0].request.body)["SortBy"] == "GmtCreated"
+
+
+@responses.activate
+def test_only_configured_task_types_are_admitted(tmp_path):
+    """v0.1 只提交 vllm（text-generation）。放开其他类型会让队列被无法提交的候选
+    占满——每个候选都要花一次 10s 的平台查询，而单 tick 只评估 20 个。"""
+    responses.put(_API, json=_payload(
+        _model("org", "textgen", ["text-generation"], 999),
+        _model("org", "image", ["text-to-image-synthesis"], 999),
+    ))
+    store = SqliteStorage(str(tmp_path / "t.db"))
+    got = ModelScopeSource(store).fetch()  # 默认只收 text-generation
+    assert [c.model_id for c in got] == ["org/textgen"]

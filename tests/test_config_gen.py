@@ -7,13 +7,12 @@ from auto_adapter import config_gen
 from auto_adapter.storage.sqlite import SqliteStorage
 
 
-def test_tp_size_by_params():
-    assert config_gen.resolve_tp_size("7B") == 1
-    assert config_gen.resolve_tp_size("13.5B") == 1
-    assert config_gen.resolve_tp_size("14B") == 2
-    assert config_gen.resolve_tp_size("70B") == 2
-    assert config_gen.resolve_tp_size("72B") == 4
-    assert config_gen.resolve_tp_size(None) == 1
+def test_initial_tp_size_is_always_conservative():
+    """gpu_num 同时意味着"向平台申请几张卡"。猜大了会因"机器没这么多卡"直接失败，
+    而重试梯子的调整方向是加大 tp——它修不好这类失败。猜小导致的 OOM 反而是
+    梯子能修的（rung 2 翻倍）。所以首次提交一律从 1 张卡起步。"""
+    for size in ("7B", "13.5B", "14B", "70B", "72B", None):
+        assert config_gen.resolve_tp_size(size) == 1
 
 
 def test_task_type_from_pipeline_tag(candidate):

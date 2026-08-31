@@ -88,3 +88,25 @@ def map_platform_result(status: str, verify_result) -> object:
             return TaskStatus.SUCCESS
         return NEEDS_CLASSIFICATION
     return None
+
+
+# 发现层的下载量门槛：新发布的模型绝大多数是个人试验品（实测 ModelScope 最新列表
+# 里下载量普遍是 1~3），不设门槛会把验证算力浪费在没人用的模型上。
+# text-generation 是主力赛道、竞争充分，门槛高些；其他类型基数小，门槛低些。
+MIN_DOWNLOADS_TEXT_GENERATION = 50
+MIN_DOWNLOADS_OTHER = 5
+
+
+def min_downloads_for(task_type: str | None) -> int:
+    """该任务类型进入候选队列所需的最小下载量。"""
+    if task_type == "text-generation":
+        return MIN_DOWNLOADS_TEXT_GENERATION
+    return MIN_DOWNLOADS_OTHER
+
+
+def passes_download_threshold(task_type: str | None, downloads) -> bool:
+    """下载量未知（None/非数字）时视为不达标——宁可漏掉也不浪费验证算力。"""
+    try:
+        return int(downloads) > min_downloads_for(task_type)
+    except (TypeError, ValueError):
+        return False

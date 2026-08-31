@@ -161,7 +161,8 @@ def build_deps(settings: Settings) -> Deps:
     sources = [ManualBountySource(settings.bounty_config_path)]
     if settings.modelscope_discovery_enabled:
         # 平台内网连不上 huggingface.co，ModelScope 是那里唯一可达的模型源。
-        sources.append(ModelScopeSource(storage, limit=settings.hf_fetch_limit))
+        sources.append(ModelScopeSource(storage, limit=settings.hf_fetch_limit,
+                                       task_types=settings.discovery_task_types))
     if settings.hf_discovery_enabled:
         # storage 注入：1h 节流时间戳必须落盘，否则崩溃重启循环会每次重启
         # 都打一遍上游（CLAUDE.md：禁止业务模块自建内存态）。
