@@ -122,3 +122,21 @@ def test_rendered_config_has_no_developer_comments():
     assert "占位符" not in text
     cfg = yaml.safe_load(text)  # 剥注释后仍是合法 YAML
     assert cfg["framework"] == "vllm" and cfg["sut_config"]["gpu_num"] == 2
+
+
+def test_gguf_routes_to_llama_cpp_not_vllm(candidate):
+    """GGUF 是 llama.cpp 的格式，vllm 跑不了。账号历史里的 GGUF 任务
+    （Mistral-7B-Instruct-v0.3-GGUF 等）在 Ascend_910-b4 上全部验证失败。"""
+    from dataclasses import replace as _replace
+    c = _replace(candidate, model_id="bartowski/darkps_ice-AI-GGUF")
+    assert config_gen.resolve_framework(c) == "llama.cpp"
+
+
+def test_gguf_is_not_submittable_in_v0_1(candidate):
+    """llama.cpp 的 configParams 启动命令没有可信来源，猜一条出来重试梯子也修不好
+    （它只调并行度和显存）。拿到真实模板前一律交人工。"""
+    from dataclasses import replace as _replace
+    c = _replace(candidate, model_id="org/model-GGUF")
+    with pytest.raises(config_gen.UnresolvableCandidateError) as exc:
+        config_gen.build_request(c, "MetaX_c-500", "uuid-1")
+    assert exc.value.framework == "llama.cpp"

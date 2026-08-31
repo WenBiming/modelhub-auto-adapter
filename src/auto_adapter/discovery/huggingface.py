@@ -50,6 +50,8 @@ class HuggingFaceSource:
             model_id = item.get("modelId") or item.get("id")
             if not model_id:
                 continue
+            if rules.is_gguf(model_id):
+                continue  # GGUF 是 llama.cpp 格式，v0.1 提交不了（见 config_gen）
             if not rules.passes_download_threshold(
                     item.get("pipeline_tag"), item.get("downloads")):
                 continue

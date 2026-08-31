@@ -122,3 +122,14 @@ def test_stops_paging_at_the_end_of_the_list(tmp_path):
     store = SqliteStorage(str(tmp_path / "t.db"))
     assert len(ModelScopeSource(store, limit=50).fetch()) == 1
     assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_gguf_models_are_filtered_out(tmp_path):
+    """在发现层就滤掉，省下每个候选一次 10s 的平台查询。"""
+    responses.put(_API, json=_payload(
+        _model("bartowski", "darkps_ice-AI-GGUF", ["text-generation"], 999),
+        _model("org", "plain-7B", ["text-generation"], 999),
+    ))
+    store = SqliteStorage(str(tmp_path / "t.db"))
+    assert [c.model_id for c in ModelScopeSource(store).fetch()] == ["org/plain-7B"]

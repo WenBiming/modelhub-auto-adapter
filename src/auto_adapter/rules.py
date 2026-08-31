@@ -23,7 +23,22 @@ VLLM_SUPPORTED_ARCHITECTURES: set[str] = {
     "MistralForCausalLM",
 }
 
+# 平台支持的推理框架（由平台使用者确认）。configParams 的启动命令按框架不同，
+# 目前只有 vllm 的模板得到过官方样例佐证（spec 附录 A.1.1）。
+PLATFORM_FRAMEWORKS = ("vllm", "llama.cpp")
+
 FALLBACK_FRAMEWORK = "transformers"  # 平台实际备选框架名待确认
+
+# GGUF 是 llama.cpp 的模型格式，vllm 跑不了它。
+# 佐证：账号历史里的 GGUF 任务（Mistral-7B-Instruct-v0.3-GGUF、BitCPM4-0.5B-GGUF、
+# Mistral-7B-v0.3-Chinese-Chat-GGUF）在 Ascend_910-b4 上全部验证失败。
+# 这类失败重试梯子修不了——它只调并行度和显存，改不了格式与框架不匹配。
+GGUF_MARKERS = ("gguf",)
+
+
+def is_gguf(model_id: str) -> bool:
+    lowered = (model_id or "").lower()
+    return any(marker in lowered for marker in GGUF_MARKERS)
 
 # 平台支持的全部 GPU 型号，取自平台任务列表页「GPU类型」筛选下拉框（2026-08-29）。
 KNOWN_GPUS = [

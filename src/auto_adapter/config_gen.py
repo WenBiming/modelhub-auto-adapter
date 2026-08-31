@@ -8,7 +8,10 @@ from . import rules
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
-# v0.1 只允许提交 vllm 候选（理由见 build_request）。
+# v0.1 只允许提交 vllm 候选：平台还支持 llama.cpp（GGUF 模型该走这条路），但它的
+# configParams 启动命令没有任何可信来源——官方样例只给了 vllm 的。凭猜测拼一条
+# 启动命令，失败重试梯子也修不好（它只调并行度和显存）。
+# 拿到 llama.cpp 的真实 configParams 后，把它加进这里并补一个 templates/llama.cpp.yaml 即可。
 SUPPORTED_FRAMEWORKS = ("vllm",)
 
 
@@ -63,7 +66,12 @@ def resolve_framework(candidate) -> str:
     """架构在 vllm 支持列表 → vllm；否则退化到备选框架（rules.py 维护）。"""
     if candidate.model_id in rules.MANUAL_OVERRIDES:
         return rules.MANUAL_OVERRIDES[candidate.model_id][1]
-    # v0.1 范围：按 task_type 选框架（计划 Global Constraints 的 YAGNI 决定）。
+    # GGUF 是 llama.cpp 的格式，送给 vllm 必然失败（账号历史里的 GGUF 任务全部
+    # 验证失败）。路由到 llama.cpp 才是语义正确的——虽然 v0.1 还提交不了它
+    # （见 SUPPORTED_FRAMEWORKS），但至少不会被错误地当成 vllm 候选。
+    if rules.is_gguf(candidate.model_id):
+        return "llama.cpp"
+    # v0.1 范围：其余按 task_type 选框架（计划 Global Constraints 的 YAGNI 决定）。
     # spec §4.4 要求的"按模型架构判断 vllm 支持"是后续迭代项——CandidateModel
     # 目前不携带 architecture 字段，需先扩展发现层才能实现。
     if resolve_task_type(candidate) == "text-generation":

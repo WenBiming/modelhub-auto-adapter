@@ -89,6 +89,7 @@ class ModelScopeSource:
 
         out: list[CandidateModel] = []
         below_threshold = 0
+        gguf_skipped = 0
         for item in models:
             if len(out) >= self._limit:
                 break
@@ -103,6 +104,9 @@ class ModelScopeSource:
             if not org or not name:
                 continue
             model_id = f"{org}/{name}"
+            if rules.is_gguf(model_id):
+                gguf_skipped += 1
+                continue  # llama.cpp 格式，v0.1 提交不了（见 config_gen）
             m = _PARAMS_RE.search(name)
             out.append(CandidateModel(
                 source="modelscope", model_id=model_id,
@@ -113,5 +117,6 @@ class ModelScopeSource:
                 discovered_at=datetime.now(timezone.utc),
             ))
         logger.info("modelscope: %d candidates from %d newest models "
-                    "(%d below the download threshold)", len(out), len(models), below_threshold)
+                    "(%d below the download threshold, %d GGUF)",
+                    len(out), len(models), below_threshold, gguf_skipped)
         return out
