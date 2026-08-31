@@ -74,10 +74,13 @@ def evaluate(
                 candidate.model_id, sorted(covered) or "(none)")
 
     # 本地已有记录的卡同样要排除：那些组合我们自己已经提交过/拉黑过。
-    locally_taken = {g for g in rules.KNOWN_GPUS
+    # GGUF 走 llama.cpp，而 llama-server 的路径按厂商编译，只有已知路径的卡能投。
+    allowed = rules.submittable_gpus_for(candidate.model_id)
+    locally_taken = {g for g in allowed
                      if storage.get_task(candidate.model_id, g) is not None}
 
-    target_gpu = config_gen.select_target_gpu(storage, exclude=covered | locally_taken)
+    target_gpu = config_gen.select_target_gpu(
+        storage, exclude=covered | locally_taken, allowed=allowed)
     if target_gpu is None:
         return Decision(
             Verdict.SKIP_DUPLICATE,

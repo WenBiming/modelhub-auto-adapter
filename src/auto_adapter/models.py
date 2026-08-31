@@ -63,6 +63,9 @@ class CandidateModel:
     is_bounty: bool
     bounty_deadline: datetime | None
     discovered_at: datetime
+    # GGUF 仓库含十几个量化档，llama-server 的 --model 要具体文件名。
+    # 在发现层解析（HTTP 只允许出现在客户端与发现层），随候选一路带下去。
+    model_file: str | None = None
 
 
 @dataclass

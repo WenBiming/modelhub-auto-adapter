@@ -124,19 +124,64 @@ def test_rendered_config_has_no_developer_comments():
     assert cfg["framework"] == "vllm" and cfg["sut_config"]["gpu_num"] == 2
 
 
-def test_gguf_routes_to_llama_cpp_not_vllm(candidate):
+def test_gguf_routes_to_llamacpp_not_vllm(candidate):
     """GGUF 是 llama.cpp 的格式，vllm 跑不了。账号历史里的 GGUF 任务
-    （Mistral-7B-Instruct-v0.3-GGUF 等）在 Ascend_910-b4 上全部验证失败。"""
+    （Mistral-7B-Instruct-v0.3-GGUF 等）在 Ascend_910-b4 上全部验证失败。
+    注意平台上的框架名是 "llamacpp"（无点号），取自一次真实的手工提交配置。"""
     from dataclasses import replace as _replace
     c = _replace(candidate, model_id="bartowski/darkps_ice-AI-GGUF")
-    assert config_gen.resolve_framework(c) == "llama.cpp"
+    assert config_gen.resolve_framework(c) == "llamacpp"
 
 
-def test_gguf_is_not_submittable_in_v0_1(candidate):
-    """llama.cpp 的 configParams 启动命令没有可信来源，猜一条出来重试梯子也修不好
-    （它只调并行度和显存）。拿到真实模板前一律交人工。"""
+def test_gguf_builds_a_llamacpp_request_on_a_known_gpu(candidate):
     from dataclasses import replace as _replace
-    c = _replace(candidate, model_id="org/model-GGUF")
+
+    from auto_adapter import rules
+    c = _replace(candidate, model_id="org/model-GGUF", model_file="model-Q4_K_M.gguf")
+
+    req = config_gen.build_request(c, "Ascend_910-b4", "uuid-1")
+
+    cfg = yaml.safe_load(req.config_params)
+    assert req.framework == "llamacpp"
+    assert cfg["framework"] == "llamacpp" and cfg["nv_framework"] == "llamacpp"
+    assert cfg["api"] == "chat"
+    cmd = cfg["sut_config"]["values"]["command"]
+    assert cmd[0] == rules.LLAMACPP_SUT_BINARIES["Ascend_910-b4"]
+    assert cmd[cmd.index("--model") + 1] == "/model/model-Q4_K_M.gguf"
+    # 参照系统用通用构建路径，模型文件与被测系统一致
+    ref = cfg["ref_config"]["values"]["command"]
+    assert ref[0] == "/workspace/llama.cpp/build/bin/llama-server"
+    assert ref[ref.index("--model") + 1] == "/model/model-Q4_K_M.gguf"
+
+
+def test_gguf_on_a_gpu_without_a_known_binary_is_refused(candidate):
+    """llama-server 按厂商编译，路径猜错了容器根本起不来——而重试梯子只调并行度
+    和显存，修不了一个不存在的可执行文件路径。只有 Ascend 有实证路径。"""
+    from dataclasses import replace as _replace
+    c = _replace(candidate, model_id="org/model-GGUF", model_file="m-Q4_K_M.gguf")
     with pytest.raises(config_gen.UnresolvableCandidateError) as exc:
         config_gen.build_request(c, "MetaX_c-500", "uuid-1")
-    assert exc.value.framework == "llama.cpp"
+    assert exc.value.reason == "unknown_llamacpp_binary"
+
+
+def test_gguf_without_a_resolved_file_is_refused(candidate):
+    from dataclasses import replace as _replace
+    c = _replace(candidate, model_id="org/model-GGUF", model_file=None)
+    with pytest.raises(config_gen.UnresolvableCandidateError) as exc:
+        config_gen.build_request(c, "Ascend_910-b4", "uuid-1")
+    assert exc.value.reason == "missing_gguf_file"
+
+
+def test_quant_preference_avoids_extremes():
+    """避开 f32/f16（体积巨大）与 IQ1/IQ2（质量损失过大，Judge 大概率过不了）。"""
+    from auto_adapter import rules
+    files = ["m-f32.gguf", "m-IQ1_S.gguf", "m-Q2_K.gguf", "m-Q4_K_M.gguf", "m-Q8_0.gguf"]
+    assert rules.pick_gguf_file(files) == "m-Q4_K_M.gguf"
+    assert rules.pick_gguf_file(["m-f32.gguf", "m-Q8_0.gguf"]) == "m-Q8_0.gguf"
+    assert rules.pick_gguf_file(["readme.md"]) is None
+
+
+def test_gguf_candidates_are_restricted_to_gpus_with_a_known_binary():
+    from auto_adapter import rules
+    assert rules.submittable_gpus_for("org/plain-7B") == rules.KNOWN_GPUS
+    assert rules.submittable_gpus_for("org/m-GGUF") == ["Ascend_910-b4"]

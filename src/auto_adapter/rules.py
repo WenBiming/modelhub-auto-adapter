@@ -40,6 +40,49 @@ def is_gguf(model_id: str) -> bool:
     lowered = (model_id or "").lower()
     return any(marker in lowered for marker in GGUF_MARKERS)
 
+
+# llama.cpp 在平台上的框架名是 "llamacpp"（无点号）——取自一次真实的手工提交配置。
+LLAMACPP_FRAMEWORK = "llamacpp"
+
+# llama-server 二进制路径**按厂商编译**：Ascend 用 build_ascend，参照系统用 build。
+# 目前只有 Ascend 这一条实证，其余 9 张卡的路径未知——猜错了容器根本起不来，
+# 而重试梯子只调并行度和显存，修不了一个不存在的可执行文件路径。
+# 因此 GGUF 候选只投这里有记录的卡（见 submittable_gpus_for）。
+LLAMACPP_SUT_BINARIES = {
+    "Ascend_910-b4": "/workspace/llama.cpp/build_ascend/bin/llama-server",
+}
+
+# 量化档偏好：Q4_K_M 是公认的体积/质量平衡点，往下依次退让。
+# 避开 f32/f16（体积巨大）与 IQ1/IQ2（质量损失过大，LLM Judge 大概率过不了）。
+GGUF_QUANT_PREFERENCE = (
+    "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q4_0",
+    "Q6_K", "Q8_0", "Q3_K_M", "Q3_K_L",
+)
+
+
+def pick_gguf_file(file_names) -> str | None:
+    """按量化偏好从仓库文件列表里挑一个 .gguf；都不匹配时返回 None。
+
+    GGUF 仓库通常含十几个量化档（实测 Mistral-7B-Instruct-v0.3-GGUF 有 23 个），
+    而 llama-server 的 --model 要求具体文件名，必须选一个。
+    """
+    ggufs = [n for n in (file_names or []) if str(n).lower().endswith(".gguf")]
+    for quant in GGUF_QUANT_PREFERENCE:
+        for name in ggufs:
+            if quant.lower() in name.lower():
+                return name
+    return None
+
+
+def submittable_gpus_for(model_id: str) -> list[str]:
+    """该模型可以投哪些卡。
+
+    GGUF 走 llama.cpp，而 llama-server 的路径按厂商编译，只有已知路径的卡能投。
+    """
+    if is_gguf(model_id):
+        return [g for g in KNOWN_GPUS if g in LLAMACPP_SUT_BINARIES]
+    return list(KNOWN_GPUS)
+
 # 平台支持的全部 GPU 型号，取自平台任务列表页「GPU类型」筛选下拉框（2026-08-29）。
 KNOWN_GPUS = [
     "Ascend_910-b4",

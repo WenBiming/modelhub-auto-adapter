@@ -1,0 +1,57 @@
+framework: llamacpp
+nv_framework: llamacpp
+api: chat
+lang: zh
+max_model_len: {max_model_len}
+max_tokens: 1024
+temperature: 0.7
+repetition_penalty: 1.1
+top_p: 0.9
+sut_config:
+  gpu_num: {tp_size}
+  values:
+    command:
+      - "{sut_binary}"
+      - --model
+      - "/model/{gguf_file}"
+      - --alias
+      - llm
+      - --threads
+      - "16"
+      - --n-gpu-layers
+      - "128"
+      - --prio
+      - "3"
+      - --min_p
+      - "0.01"
+      - --ctx-size
+      - "{max_model_len}"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3316"
+      - --jinja
+      - --flash-attn
+      - "off"
+ref_config:
+  gpu_num: {tp_size}
+  values:
+    command:
+      - /workspace/llama.cpp/build/bin/llama-server
+      - --model
+      - "/model/{gguf_file}"
+      - --alias
+      - llm
+      - --threads
+      - "20"
+      - --n-gpu-layers
+      - "128"
+      - --ctx-size
+      - "{max_model_len}"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --jinja
+      - --flash-attn
+      - "off"

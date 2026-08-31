@@ -8,11 +8,9 @@ from . import rules
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
-# v0.1 只允许提交 vllm 候选：平台还支持 llama.cpp（GGUF 模型该走这条路），但它的
-# configParams 启动命令没有任何可信来源——官方样例只给了 vllm 的。凭猜测拼一条
-# 启动命令，失败重试梯子也修不好（它只调并行度和显存）。
-# 拿到 llama.cpp 的真实 configParams 后，把它加进这里并补一个 templates/llama.cpp.yaml 即可。
-SUPPORTED_FRAMEWORKS = ("vllm",)
+# 可提交的框架。llamacpp 的模板来自一次真实的手工提交配置（见 templates/llamacpp.yaml）；
+# transformers 仍然不可提交——它的启动命令没有任何可信来源。
+SUPPORTED_FRAMEWORKS = ("vllm", "llamacpp")
 
 
 class UnresolvableCandidateError(ValueError):
@@ -70,7 +68,7 @@ def resolve_framework(candidate) -> str:
     # 验证失败）。路由到 llama.cpp 才是语义正确的——虽然 v0.1 还提交不了它
     # （见 SUPPORTED_FRAMEWORKS），但至少不会被错误地当成 vllm 候选。
     if rules.is_gguf(candidate.model_id):
-        return "llama.cpp"
+        return rules.LLAMACPP_FRAMEWORK
     # v0.1 范围：其余按 task_type 选框架（计划 Global Constraints 的 YAGNI 决定）。
     # spec §4.4 要求的"按模型架构判断 vllm 支持"是后续迭代项——CandidateModel
     # 目前不携带 architecture 字段，需先扩展发现层才能实现。
@@ -79,7 +77,8 @@ def resolve_framework(candidate) -> str:
     return rules.FALLBACK_FRAMEWORK
 
 
-def select_target_gpu(storage, exclude: set[str] | None = None) -> str | None:
+def select_target_gpu(storage, exclude: set[str] | None = None,
+                      allowed: list[str] | None = None) -> str | None:
     """在 rules.KNOWN_GPUS 里挑一张目标卡，排除 exclude 里的型号；无可选时返回 None。
 
     exclude 由调用方传入"这个模型已经适配过的卡"——**必须逐候选计算**。
@@ -91,14 +90,15 @@ def select_target_gpu(storage, exclude: set[str] | None = None) -> str | None:
     多张可选时按平台覆盖率从低到高挑，让适配矩阵往稀疏处生长。
     """
     coverage = storage.gpu_coverage()
-    available = [g for g in rules.KNOWN_GPUS if g not in (exclude or set())]
+    pool = rules.KNOWN_GPUS if allowed is None else allowed
+    available = [g for g in pool if g not in (exclude or set())]
     if not available:
         return None
     return min(available, key=lambda g: coverage.get(g, 0))
 
 
 def render_config_params(framework: str, tp_size: int, max_model_len: int = 4096,
-                         gpu_mem_util: float = 0.9) -> str:
+                         gpu_mem_util: float = 0.9, **extra) -> str:
     """渲染 templates/{framework}.yaml 为 configParams YAML 字符串（spec 附录 A.1.1）。
 
     模板顶部的开发注释会被剥掉：它们随 configParams 一起发给平台没有意义，而且
@@ -109,7 +109,7 @@ def render_config_params(framework: str, tp_size: int, max_model_len: int = 4096
     body = "\n".join(line for line in template.splitlines()
                      if not line.lstrip().startswith("#"))
     return body.format(tp_size=tp_size, max_model_len=max_model_len,
-                       gpu_mem_util=gpu_mem_util) + "\n"
+                       gpu_mem_util=gpu_mem_util, **extra) + "\n"
 
 
 def build_request(candidate, target_gpu, strategy_id):
@@ -132,7 +132,23 @@ def build_request(candidate, target_gpu, strategy_id):
             f"framework {framework!r} is not submittable in v0.1 "
             f"(only {SUPPORTED_FRAMEWORKS}); {candidate.model_id} needs human review",
             framework=framework)
-    config = render_config_params(framework, resolve_tp_size(candidate.params_size))
+    extra = {}
+    if framework == rules.LLAMACPP_FRAMEWORK:
+        binary = rules.LLAMACPP_SUT_BINARIES.get(target_gpu)
+        if binary is None:
+            # llama-server 按厂商编译，路径猜错了容器根本起不来，而重试梯子
+            # 只调并行度和显存，修不了一个不存在的可执行文件路径。
+            raise UnresolvableCandidateError(
+                "unknown_llamacpp_binary",
+                f"no llama.cpp binary path known for {target_gpu}; "
+                f"{candidate.model_id} needs human review", framework=framework)
+        if not candidate.model_file:
+            raise UnresolvableCandidateError(
+                "missing_gguf_file",
+                f"no usable .gguf quantisation resolved for {candidate.model_id}",
+                framework=framework)
+        extra = {"sut_binary": binary, "gguf_file": candidate.model_file}
+    config = render_config_params(framework, resolve_tp_size(candidate.params_size), **extra)
     from .models import AddTaskRequest
     return AddTaskRequest(
         model_address=candidate.model_url, task_type=task_type,

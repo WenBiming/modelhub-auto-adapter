@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _API = "https://www.modelscope.cn/api/v1/dolphin/models"
 _MODEL_URL = "https://www.modelscope.cn/models/{model_id}"
+_FILES_API = "https://www.modelscope.cn/api/v1/models/{model_id}/repo/files"
 _PARAMS_RE = re.compile(r"(\d+(?:\.\d+)?)[bB]\b")
 # 按发布时间倒序：新模型才是"平台从没见过"的那批（5 积分/个）；按下载量排序拿到的
 # 全是热门老模型，实测 17 个里 5 个所有可提交的卡都已适配、其余也只剩零星空位。
@@ -67,6 +68,21 @@ class ModelScopeSource:
         task_type = next((t for t in tasks if t in self._task_types), None)
         return task_type is not None and rules.passes_download_threshold(
             task_type, item.get("Downloads"))
+
+    def _resolve_gguf_file(self, model_id: str) -> str | None:
+        """列出仓库文件并按量化偏好挑一个 .gguf（rules.pick_gguf_file）。
+
+        网络失败时返回 None（跳过该候选）——组不出可信的启动命令就别提交。
+        """
+        try:
+            resp = requests.get(_FILES_API.format(model_id=model_id),
+                                params={"Revision": "master", "Root": ""}, timeout=10)
+            resp.raise_for_status()
+            files = (resp.json().get("Data") or {}).get("Files") or []
+        except Exception as e:
+            logger.warning("cannot list files for %s: %s", model_id, e)
+            return None
+        return rules.pick_gguf_file([f.get("Name") for f in files])
 
     def fetch(self) -> list[CandidateModel]:
         now = int(time.time())
@@ -112,9 +128,12 @@ class ModelScopeSource:
             if not org or not name:
                 continue
             model_id = f"{org}/{name}"
+            gguf_file = None
             if rules.is_gguf(model_id):
-                gguf_skipped += 1
-                continue  # llama.cpp 格式，v0.1 提交不了（见 config_gen）
+                gguf_file = self._resolve_gguf_file(model_id)
+                if gguf_file is None:
+                    gguf_skipped += 1
+                    continue  # 没有可用的量化档，投出去也是白费
             m = _PARAMS_RE.search(name)
             out.append(CandidateModel(
                 source="modelscope", model_id=model_id,
@@ -123,8 +142,9 @@ class ModelScopeSource:
                 params_size=f"{m.group(1)}B" if m else None,
                 is_bounty=False, bounty_deadline=None,
                 discovered_at=datetime.now(timezone.utc),
+                model_file=gguf_file,
             ))
         logger.info("modelscope: %d candidates from %d newest models "
-                    "(%d below the download threshold, %d GGUF)",
+                    "(%d below the download threshold, %d GGUF unusable)",
                     len(out), len(models), below_threshold, gguf_skipped)
         return out
