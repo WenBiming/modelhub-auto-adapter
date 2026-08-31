@@ -42,9 +42,8 @@ M1–M6 均已实现：健康检查 + SIGTERM 优雅停机、HF/悬赏发现、�
   平台明确拒绝（其余业务码）才允许退回 QUEUED 重试。
 
 上线前仍需人工核对（不属于代码任务，见 spec §9 及 DoD）：
-- 用真实平台 `status`/`verifyResult` 枚举值回填 `rules.PLATFORM_STATUS_MAP`
-  （当前为占位映射）；
-- 按实际可用算力扩充 `rules.KNOWN_GPUS`（当前仅 `MetaX_c-500` 一项）；
+- ~~回填 `status`/`verifyResult` 枚举~~ 与 ~~扩充 `KNOWN_GPUS`~~ 已完成
+  （实测自平台页面，见 spec 附录 B）；
 - 准备生产环境的悬赏 JSON 配置文件（`BOUNTY_CONFIG_PATH` 指向的人工维护列表）。
 
 熔断开关（kill switch）的触发条件、查看方式与人工清除步骤见 README「运维：熔断开关」。

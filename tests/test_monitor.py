@@ -34,8 +34,8 @@ def test_status_sync_success_and_failure(store):
     store.insert_task(_pending("org/b", 2))
     client = Mock()
     client.list_my_tasks.return_value = _page(
-        {"taskId": 1, "status": "SUCCESS"},
-        {"taskId": 2, "status": "FAILED"},
+        {"taskId": 1, "status": "success", "verifyResult": 1},
+        {"taskId": 2, "status": "failed", "verifyResult": 1},
     )
     client.get_task_log.return_value = "CUDA out of memory"
     monitor.poll(store, client, SETTINGS, now=NOW)
@@ -57,7 +57,7 @@ def test_vanished_task_triggers_kill_switch(store):
 def test_stuck_task_marked_timeout(store):
     store.insert_task(_pending("org/a", 1, submit_time=NOW - timedelta(hours=7)))
     client = Mock()
-    client.list_my_tasks.return_value = _page({"taskId": 1, "status": "RUNNING"})
+    client.list_my_tasks.return_value = _page({"taskId": 1, "status": "running", "verifyResult": 1})
     monitor.poll(store, client, SETTINGS, now=NOW)
     assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.TIMEOUT
 
@@ -65,7 +65,7 @@ def test_stuck_task_marked_timeout(store):
 def test_unknown_status_left_unchanged(store):
     store.insert_task(_pending("org/a", 1))
     client = Mock()
-    client.list_my_tasks.return_value = _page({"taskId": 1, "status": "WEIRD_STATE"})
+    client.list_my_tasks.return_value = _page({"taskId": 1, "status": "WEIRD_STATE", "verifyResult": 1})
     monitor.poll(store, client, SETTINGS, now=NOW)
     assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.PENDING
 
@@ -79,10 +79,10 @@ def test_multi_page_listing_syncs_status_without_false_vanish(store):
 
     def list_my_tasks(current=1, page_size=50, **filters):
         if current == 1:
-            return {"records": [{"taskId": 1000, "status": "SUCCESS"}],
+            return {"records": [{"taskId": 1000, "status": "success", "verifyResult": 1}],
                     "total": 2, "current": 1, "pages": 2, "size": 100}
         if current == 2:
-            return {"records": [{"taskId": 99, "status": "RUNNING"}],
+            return {"records": [{"taskId": 99, "status": "running", "verifyResult": 1}],
                     "total": 2, "current": 2, "pages": 2, "size": 100}
         return {"records": [], "total": 2, "current": current, "pages": 2, "size": 100}
 
@@ -104,7 +104,7 @@ def test_page_cap_truncation_never_vanishes_a_task(store):
     def list_my_tasks(current=1, page_size=50, **filters):
         # every page has a decoy record (never taskId 99) and reports far more pages
         # than MAX_PAGES, forcing the cap to trigger before task 99 could ever be found.
-        return {"records": [{"taskId": 9000 + current, "status": "SUCCESS"}],
+        return {"records": [{"taskId": 9000 + current, "status": "success", "verifyResult": 1}],
                 "total": 999, "current": current, "pages": 999, "size": 100}
 
     client.list_my_tasks.side_effect = list_my_tasks
@@ -131,7 +131,7 @@ def test_success_resets_consecutive_engine_failures_counter(store):
     store.insert_task(_pending("org/a", 1))
     store.set_counter("consecutive_engine_failures", 4)
     client = Mock()
-    client.list_my_tasks.return_value = _page({"taskId": 1, "status": "SUCCESS"})
+    client.list_my_tasks.return_value = _page({"taskId": 1, "status": "success", "verifyResult": 1})
     monitor.poll(store, client, SETTINGS, now=NOW)
     assert store.get_counter("consecutive_engine_failures") == 0
 
@@ -163,7 +163,7 @@ def test_pending_with_no_task_id_marked_needs_human(store, caplog):
     assert "org/a" in caplog.text
 
 
-def _row(task_id, status="RUNNING", model_id="org/a", gpu="MetaX_c-500", **extra):
+def _row(task_id, status="running", model_id="org/a", gpu="MetaX_c-500", **extra):
     return {"taskId": task_id, "status": status,
             "modelId": model_id, "gpuType": gpu, **extra}
 
@@ -354,3 +354,50 @@ def test_orphan_not_reattached_to_stale_row_on_truncated_enumeration(store):
 
     rec = store.get_task("org/a", "MetaX_c-500")
     assert rec.task_id is None and rec.status == TaskStatus.PENDING
+
+
+def test_success_with_failed_verify_result_is_not_a_success(store):
+    """平台的 status 与 verifyResult 是正交字段（实测自平台 UI 筛选，2026-08-29）：
+    status=success 只表示"作业跑完了"，适配是否通过看 verifyResult。
+
+    这是本系统最危险的一条误判：只看 status 会把每一个 verifyResult=-1（验证失败）
+    的任务记成适配成功——既不会进入重试/拉黑流程，成功率指标也全是假的。
+    用户账号里绝大多数历史记录正是 status=success + verifyResult=-1。
+    """
+    store.insert_task(_pending("org/a", 1))
+    client = Mock()
+    client.list_my_tasks.return_value = _page(
+        {"taskId": 1, "status": "success", "verifyResult": -1,
+         "statusText": "成功", "verifyResultText": "验证失败"})
+    client.get_task_log.return_value = "LLM judge score below threshold"
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.status != TaskStatus.SUCCESS
+    assert rec.status == TaskStatus.QUALITY_FAILED  # 日志把它归为质量失败
+
+
+def test_success_without_verify_result_is_not_assumed_passed(store):
+    """verifyResult 缺失/未知时同样不得宣布成功——只有明确的 1 才算通过。"""
+    store.insert_task(_pending("org/a", 1))
+    client = Mock()
+    client.list_my_tasks.return_value = _page({"taskId": 1, "status": "success"})
+    client.get_task_log.return_value = "CUDA out of memory"
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.ENGINE_FAILED
+
+
+def test_waiting_status_syncs_to_pending(store):
+    """平台排队态的真实值是小写 waiting；早先的映射表只有 QUEUED/PENDING，
+    会把它当成未知状态而永不同步，任务一直卡到 6 小时超时。"""
+    store.insert_task(_pending("org/a", 1))
+    client = Mock()
+    client.list_my_tasks.return_value = _page(
+        {"taskId": 1, "status": "waiting", "verifyResult": 1})
+
+    monitor.poll(store, client, SETTINGS, now=NOW)
+
+    assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.PENDING

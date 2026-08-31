@@ -204,11 +204,11 @@ QUEUED ──submit──▶ PENDING ──▶ RUNNING ──▶ SUCCESS
 
 ## 9. 开放问题（实现前需向用户确认）
 - ~~`POST /api/adapt/task/add` 的精确 schema~~ → 已确认，见附录 A（2026-08-29 抓取自在线文档）；
+- ~~framework 与 targetGpu 的合法枚举~~ / ~~status 与 verifyResult 的枚举~~ →
+  **已确认**，见附录 B（2026-08-29 实测自平台任务列表页）；
 - 悬赏列表：开放平台 API 文档确认**没有**悬赏接口——悬赏来源需改为爬取
   「模型适配挑战」页面或人工配置列表（BountySource 实现方式待定）；
-- framework 与 targetGpu 的合法枚举列表文档未给出（样例仅见 `vllm`、`MetaX_c-500`），
-  需从平台页面或试探确认；
-- `status` / `stage` / `verifyResult` 的枚举取值文档未给出，M5 实现前需用真实任务观察确认。
+- `stage` 与 framework 的合法枚举仍未确认（framework 样例仅见 `vllm`，v0.1 只提交 vllm）。
 
 ---
 
@@ -329,3 +329,40 @@ Query：`modelId: string`（必填）。响应 `data: ModelSearchResultVO`：
 | 40400 | NOT_FOUND_ERROR | 资源不存在 | 按业务分支处理（如查无模型） |
 | 50000 | SYSTEM_ERROR | 系统内部异常 | 记日志，下个 tick 重试 |
 | 50001 | OPERATION_ERROR | 操作执行失败 | 记日志，检查参数后重试 |
+
+
+---
+
+## 附录 B：状态与 GPU 枚举（实测自平台任务列表页，2026-08-29）
+
+来源：`https://modelhub.org.cn/#/profile` 的「我的适配任务」筛选控件与其发出的
+`/api/adapt/task/page` 请求参数、以及响应记录的原始字段值。
+
+### B.1 status 与 verifyResult 是正交的两个字段
+
+**这是最容易踩的坑**：`status` 表示"任务作业是否执行完毕"，`verifyResult` 才表示
+"适配是否通过"。UI 上的五个标签实际是两者的组合：
+
+| UI 标签 | `status` | `verifyResult` | 本地映射 |
+|---|---|---|---|
+| 验证排队中 | `waiting` | 1 | `PENDING` |
+| 验证进行中 | `running` | 1 | `RUNNING` |
+| 验证异常 | `failed` | 1 | 拉日志分类（引擎层） |
+| 验证通过 | `success` | **1** | `SUCCESS`（唯一的真正成功） |
+| 验证失败 | `success` | **-1** | 拉日志分类（作业跑完但未通过） |
+
+响应记录同时带 `statusText`（如"成功"）与 `verifyResultText`（如"验证失败"）——
+注意"成功"指的是作业成功，不是适配成功。
+
+**保守规则（`rules.map_platform_result`）**：只有 `status=success` 且
+`verifyResult == 1` 才判定为 SUCCESS；`success` 配上任何其他 verifyResult（-1、
+缺失、未知值）一律交给日志分类。宁可多分类一次，也绝不无凭据地宣布适配成功。
+
+### B.2 targetGpu 合法枚举（10 项）
+
+`Ascend_910-b4`、`MetaX_c-500`、`Cambricon_mlu-370-x4`、`Kunlunxin_p-800`、
+`Kunlunxin_r-200-8f`、`Iluvatar_bi-150`、`Iluvatar_mrv-100`、`hygon_k100-ai`、
+`Vastai_va16`、`Sunrise_pt-200-x1`
+
+对应厂商信息可从任务记录的 `manufacturerName` / `machineName` 读到
+（如 `Ascend_910-b4` → 厂商"昇腾"、机型"910B4"）。

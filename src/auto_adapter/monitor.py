@@ -207,9 +207,11 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
             logger.error("task %s vanished from platform; kill switch ON", rec.task_id)
             continue
 
-        mapped = rules.map_platform_status(row.get("status"))
+        # status 与 verifyResult 必须成对判读：status=success 只说明作业跑完了，
+        # 适配是否通过看 verifyResult（详见 rules.map_platform_result）。
+        mapped = rules.map_platform_result(row.get("status"), row.get("verifyResult"))
 
-        if mapped == "failed":
+        if mapped == rules.NEEDS_CLASSIFICATION:
             try:
                 rec.last_log = client.get_task_log(rec.task_id)
             except Exception as e:
@@ -236,7 +238,8 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
 
         # 仍在活跃态（或状态未知）：先同步状态，再做超时判定（两者不互斥）
         if mapped is None:
-            logger.warning("unknown platform status %r for task %s", row.get("status"), rec.task_id)
+            logger.warning("unknown platform status %r (verifyResult=%r) for task %s",
+                           row.get("status"), row.get("verifyResult"), rec.task_id)
         elif mapped != rec.status:
             rec.status = mapped
             storage.update_task(rec)

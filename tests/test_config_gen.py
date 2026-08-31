@@ -53,7 +53,8 @@ def test_render_config_params_transformers_template():
 
 def test_select_target_gpu_prefers_lowest_coverage(tmp_path):
     store = SqliteStorage(str(tmp_path / "t.db"))
-    assert config_gen.select_target_gpu(store) == "MetaX_c-500"  # 空覆盖率时取 KNOWN_GPUS[0]
+    from auto_adapter import rules
+    assert config_gen.select_target_gpu(store) == rules.KNOWN_GPUS[0]  # 空覆盖率时取首位
 
 
 def test_build_request(candidate):
@@ -93,3 +94,22 @@ def test_build_request_unresolvable_task_type_reason(candidate):
 def test_vllm_candidate_still_builds(candidate):
     req = config_gen.build_request(candidate, "MetaX_c-500", "uuid-1")
     assert req.framework == "vllm"
+
+
+def test_known_gpus_covers_platform_enum():
+    """GPU 型号取自平台任务列表页的筛选下拉框（2026-08-29 实测）。
+    选卡逻辑要有意义就必须是全集——只有一个型号时 select_target_gpu 恒定返回它。"""
+    from auto_adapter import rules
+    assert set(rules.KNOWN_GPUS) == {
+        "Ascend_910-b4", "MetaX_c-500", "Cambricon_mlu-370-x4",
+        "Kunlunxin_p-800", "Kunlunxin_r-200-8f", "Iluvatar_bi-150",
+        "Iluvatar_mrv-100", "hygon_k100-ai", "Vastai_va16", "Sunrise_pt-200-x1",
+    }
+
+
+def test_select_target_gpu_picks_least_covered_among_all(tmp_path):
+    store = SqliteStorage(str(tmp_path / "t.db"))
+    from auto_adapter import rules
+    # 除 hygon_k100-ai 外都有覆盖 → 应选中它
+    store.set_gpu_coverage({g: 5 for g in rules.KNOWN_GPUS if g != "hygon_k100-ai"})
+    assert config_gen.select_target_gpu(store) == "hygon_k100-ai"

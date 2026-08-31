@@ -2,10 +2,16 @@ import json
 import threading
 from unittest.mock import Mock
 
+from auto_adapter import rules
 from auto_adapter.main import Deps, tick
 from auto_adapter.models import ModelSearchResult, Priority, TaskRecord, TaskStatus
 from auto_adapter.settings import Settings
 from auto_adapter.storage.sqlite import SqliteStorage
+
+
+# tick 通过 config_gen.select_target_gpu 选卡；空覆盖率时是 KNOWN_GPUS 首位。
+# 不要硬编码型号——GPU 列表随平台扩容变化，流程测试不该因此而红。
+SELECTED_GPU = rules.KNOWN_GPUS[0]
 
 
 def test_tick_discovers_enqueues_and_submits(tmp_path, candidate):
@@ -25,7 +31,7 @@ def test_tick_discovers_enqueues_and_submits(tmp_path, candidate):
         storage=storage, client=client, sources=[Src()],
     )
     tick(deps, threading.Event())
-    rec = storage.get_task(candidate.model_id, "MetaX_c-500")
+    rec = storage.get_task(candidate.model_id, SELECTED_GPU)
     assert rec is not None and rec.task_id == 99
     assert rec.status == TaskStatus.RUNNING  # submit 后同 tick 内 monitor 已对账
     assert storage.pending_candidates() == []  # 候选已消费
@@ -35,7 +41,7 @@ def test_tick_skips_duplicate_candidate(tmp_path, candidate):
     storage = SqliteStorage(str(tmp_path / "t.db"))
     client = Mock()
     client.search_model.return_value = ModelSearchResult(
-        True, {}, {"MetaX_c-500": {"passed": True}})
+        True, {}, {SELECTED_GPU: {"passed": True}})
     client.list_my_tasks.return_value = {"records": []}
 
     class Src:
@@ -47,7 +53,7 @@ def test_tick_skips_duplicate_candidate(tmp_path, candidate):
                 storage=storage, client=client, sources=[Src()])
     tick(deps, threading.Event())
     client.add_task.assert_not_called()
-    assert storage.get_task(candidate.model_id, "MetaX_c-500") is None
+    assert storage.get_task(candidate.model_id, SELECTED_GPU) is None
 
 
 def test_tick_stops_immediately_when_stop_event_already_set(tmp_path, candidate):
@@ -84,7 +90,7 @@ def test_tick_stops_between_monitor_and_failure(tmp_path, monkeypatch):
     client = Mock()
     client.list_my_tasks.return_value = {"records": []}
     storage.insert_task(TaskRecord(
-        model_id="m", target_gpu="MetaX_c-500", framework="vllm",
+        model_id="m", target_gpu=SELECTED_GPU, framework="vllm",
         status=TaskStatus.TIMEOUT, priority=Priority.NEW_MODEL, task_id=42))
 
     deps = Deps(settings=Settings(xc_token="t", strategy_id="s", base_url="https://x"),
@@ -158,7 +164,7 @@ def test_unresolvable_candidate_leaves_a_needs_human_record(tmp_path, candidate)
 
     tick(_deps(storage, client, [_src([mystery])]), threading.Event())
 
-    rec = storage.get_task("org/mystery", "MetaX_c-500")
+    rec = storage.get_task("org/mystery", SELECTED_GPU)
     assert rec is not None and rec.status == TaskStatus.NEEDS_HUMAN
     assert rec.model_url == mystery.model_url
     client.add_task.assert_not_called()
@@ -178,7 +184,7 @@ def test_non_vllm_candidate_is_not_submitted(tmp_path, candidate):
     tick(_deps(storage, client, [_src([embedder])]), threading.Event())
 
     client.add_task.assert_not_called()
-    rec = storage.get_task("org/bge-small", "MetaX_c-500")
+    rec = storage.get_task("org/bge-small", SELECTED_GPU)
     assert rec is not None and rec.status == TaskStatus.NEEDS_HUMAN
 
 
@@ -191,7 +197,7 @@ def test_candidates_per_tick_is_capped_and_remainder_stays_pending(tmp_path, can
 
     storage = SqliteStorage(str(tmp_path / "t.db"))
     client = Mock()
-    client.search_model.return_value = ModelSearchResult(True, {}, {"MetaX_c-500": {}})
+    client.search_model.return_value = ModelSearchResult(True, {}, {SELECTED_GPU: {}})
     client.list_my_tasks.return_value = {"records": []}
     many = [replace(candidate, model_id=f"org/m{i}")
             for i in range(main_module.MAX_CANDIDATES_PER_TICK + 5)]
@@ -251,7 +257,7 @@ def test_persistently_uncertain_candidate_stops_blocking_the_queue(tmp_path, can
     # the listing carries the task that "org/behind" will create, so reconciliation in the
     # same tick is coherent (an empty listing would read as a vanished task)
     client.list_my_tasks.return_value = {"records": [
-        {"taskId": 501, "status": "RUNNING", "modelId": "org/behind", "gpuType": "MetaX_c-500"}]}
+        {"taskId": 501, "status": "RUNNING", "modelId": "org/behind", "gpuType": SELECTED_GPU}]}
 
     blockers = [replace(candidate, model_id=f"org/blocker{i}")
                 for i in range(main_module.MAX_CANDIDATES_PER_TICK)]
@@ -268,19 +274,19 @@ def test_persistently_uncertain_candidate_stops_blocking_the_queue(tmp_path, can
     # Ticks 1..MAX-1: the blockers fill the slice and "org/behind" is never reached.
     for _ in range(main_module.MAX_UNCERTAIN_TICKS - 1):
         tick(deps, threading.Event())
-    assert storage.get_task("org/behind", "MetaX_c-500") is None
+    assert storage.get_task("org/behind", SELECTED_GPU) is None
     assert any(c.model_id == "org/behind" for c in storage.pending_candidates())
 
     # The escalating tick releases the whole slice...
     tick(deps, threading.Event())
     for blocker in blockers:
-        rec = storage.get_task(blocker.model_id, "MetaX_c-500")
+        rec = storage.get_task(blocker.model_id, SELECTED_GPU)
         assert rec is not None and rec.status == TaskStatus.NEEDS_HUMAN
         assert rec.model_url == blocker.model_url
 
     # ...and the candidate behind them is evaluated and enqueued on the next tick.
     tick(deps, threading.Event())
-    rec = storage.get_task("org/behind", "MetaX_c-500")
+    rec = storage.get_task("org/behind", SELECTED_GPU)
     assert rec is not None and rec.status not in (TaskStatus.NEEDS_HUMAN, TaskStatus.ABANDONED)
     assert client.add_task.call_args.args[0].model_address == behind.model_url
 
@@ -306,5 +312,5 @@ def test_uncertain_streak_resets_when_the_platform_answers(tmp_path, candidate):
     tick(deps, threading.Event())  # answered: streak resets, candidate enqueued normally
 
     assert storage.get_counter(main_module._uncertain_key(candidate.model_id)) == 0
-    rec = storage.get_task(candidate.model_id, "MetaX_c-500")
+    rec = storage.get_task(candidate.model_id, SELECTED_GPU)
     assert rec is not None and rec.status != TaskStatus.NEEDS_HUMAN
