@@ -17,9 +17,10 @@ RUN pip install --no-cache-dir .
 # 认领不成功则拉闸暂停提交，避免丢库导致重复提交。
 ENV STORAGE_PATH=/app/data/agent.db
 
-# 首次上线先演练：完整跑发现/去重/配置生成，但不真的提交。
-# 验证通过后把这一行改成 false（或删掉）再发一个新 tag。
-ENV DRY_RUN=true
+# 演练已完成（本机对真实平台跑通：去重、选卡、vllm 与 llamacpp 两种 configParams
+# 均已逐字核对）。现在真实提交。
+# 需要回到演练模式排查问题时，把这里改回 true 再发一个 tag。
+ENV DRY_RUN=false
 
 # 平台内网连不上 huggingface.co（线上实测 connect timeout），默认关闭该来源，
 # 只用国内可达的 ModelScope。若你的环境有 HF 镜像，设 HF_ENDPOINT 后再打开。
