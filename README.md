@@ -33,7 +33,40 @@ docker run -p 8080:8080 \
   -v $(pwd)/data:/data auto-adapter
 ```
 
-健康检查：`GET :8080/health`。
+健康检查：`GET :8080/health`（恒返回 200，平台合规要求）。
+运行状态：`GET :8080/` 返回 `{status, config_error, dry_run}`——配置写错时看这里。
+
+## 平台运行时契约
+
+平台只注入两个环境变量（实测自官方 demo 仓库 `xc_agent_platform_demo` 与提交说明）：
+
+| 变量 | 来源 | 说明 |
+|---|---|---|
+| `EXTERNAL_SERVICE_TOKEN` | 平台注入 | 平台凭据。本地开发可改用 `XC_TOKEN`，两者都接受 |
+| `STRATEGY_ID` | 平台注入 | 策略 ID，提交任务时填入 `strategyId` |
+| `MODELHUB_BASE_URL` | 可选 | 默认 `https://modelhub.org.cn` |
+
+配置缺失时进程**不会崩溃**：`/health` 先于配置校验启动并保持 200，错误原因写进
+`/` 端点与日志。这是刻意的——平台 livenessProbe 连续失败会重启 Pod，重启三次后
+标记为失败，崩溃退出等于把诊断信息一起丢掉。
+
+## 首次上线：先跑演练（DRY_RUN）
+
+设 `DRY_RUN=true` 后，智能体会完整执行发现 → 去重 → 配置生成 → 按限流挑选，
+**唯独不调用 `add_task`**，把"本来要提交什么"以 JSON 打进日志：
+
+```bash
+docker run -p 8080:8080 \
+  -e EXTERNAL_SERVICE_TOKEN=... -e STRATEGY_ID=... -e DRY_RUN=true \
+  -v $(pwd)/data:/data auto-adapter
+```
+
+演练模式下记录保持 `QUEUED`、`task_id` 保持 `None`——绝不伪造 `PENDING`/`task_id`，
+否则对账层会在平台侧找不到它，误判为"任务被平台清理"而拉下熔断闸。
+
+首次上线务必先用它验证这几件从未接触过真实平台的假设：`search_model` 返回的
+`verifyResult` 形状（去重的命脉）、`configParams` 能否被平台接受、选出来的模型
+是否合理。确认无误再去掉 `DRY_RUN`。
 
 默认基础镜像是平台 registry（本机通常不可达）。本地验证构建时用公共镜像覆盖：
 

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -72,6 +73,22 @@ def drain(storage: Storage, client: PlatformClient, settings: Settings, now: dat
             model_address=record.model_url, task_type=record.task_type,
             target_gpu=record.target_gpu, framework=record.framework,
             config_params=record.config_params, strategy_id=settings.strategy_id)
+
+        if settings.dry_run:
+            # 演练模式：完整走到"请求已组装好"这一步，然后停手。记录保持 QUEUED、
+            # task_id 保持 None——绝不能伪造 PENDING/task_id，否则 monitor 对账时
+            # 会在平台侧找不到它而误判"任务被清理"并拉闸。
+            # 每个 (model_id, target_gpu) 只详细打印一次，避免每分钟刷屏。
+            key = f"dryrun_logged:{record.model_id}@{record.target_gpu}"
+            if not storage.get_counter(key):
+                storage.set_counter(key, 1)
+                logger.info("DRY RUN would submit: %s", json.dumps({
+                    "modelAddress": req.model_address, "taskType": req.task_type,
+                    "targetGpu": req.target_gpu, "framework": req.framework,
+                    "strategyId": req.strategy_id, "configParams": req.config_params,
+                }, ensure_ascii=False))
+            submitted += 1  # 占用限流预算，让演练的节奏与真实运行一致
+            continue
 
         # Mark PENDING BEFORE network call (宁漏勿重: prevent duplicate submission)
         record.status = TaskStatus.PENDING

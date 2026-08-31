@@ -17,7 +17,11 @@ ModelHub XC「适配智能体」：自动发现 HF/ModelScope 模型并通过开
 - Python 3.11，src 布局：`src/auto_adapter/`；`pip install -e ".[dev]"` 后 `pytest`。
 - 所有平台/外部 HTTP 调用只允许出现在 `platform_client.py` 和 `discovery/` 的
   source 实现里，业务模块不直接发请求。
-- 凭据（`XC_TOKEN`、`STRATEGY_ID`）只从环境变量读取（`settings.py`），不硬编码、不写日志。
+- 凭据只从环境变量读取（`settings.py`），不硬编码、不写日志。平台注入的凭据变量名是
+  `EXTERNAL_SERVICE_TOKEN`（本地开发可用 `XC_TOKEN`），策略 ID 是 `STRATEGY_ID`。
+- 配置错误一律抛 `ConfigError` 并由 `main` 转为"存活但不工作"，绝不在 `/health`
+  监听之前崩溃退出——平台重启三次后只会给一个"失败"状态，诊断信息全丢。
+- 首次上线先用 `DRY_RUN=true` 演练：走完全链路但不调 `add_task`。
 - 状态一律走 `storage/` 接口持久化，禁止业务模块自建内存态（30s 优雅停机要求）。
 - 测试不打真实网络：平台 API 用 `responses` mock，storage 用内存 SQLite。
 

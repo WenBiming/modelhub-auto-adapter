@@ -1,15 +1,30 @@
-"""集中读取环境变量配置。凭据只在此处进入进程，禁止写日志。契约见 spec §5。"""
+"""集中读取环境变量配置。凭据只在此处进入进程，禁止写日志。契约见 spec §5。
+
+平台运行时契约（实测自官方 demo 仓库 xc_agent_platform_demo 与提交说明文档）：
+平台注入的凭据环境变量名是 **EXTERNAL_SERVICE_TOKEN**，不是 XC_TOKEN；平台也不
+注入 MODELHUB_BASE_URL。本地开发仍可用 XC_TOKEN，两者都接受。
+"""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+
+DEFAULT_BASE_URL = "https://modelhub.org.cn"
+
+# 平台注入的凭据变量名优先，其次是本地开发惯用名
+TOKEN_ENV_VARS = ("EXTERNAL_SERVICE_TOKEN", "XC_TOKEN")
+
+
+class ConfigError(Exception):
+    """配置缺失/非法。由 main 捕获后转为"存活但不工作"，而不是崩溃循环。"""
 
 
 @dataclass(frozen=True)
 class Settings:
     xc_token: str
     strategy_id: str
-    base_url: str
+    base_url: str = DEFAULT_BASE_URL
+    dry_run: bool = False
     storage_path: str = "/data/agent.db"
     tick_seconds: int = 60
     max_submits_per_minute: int = 2
@@ -22,13 +37,29 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        tick_seconds = int(os.environ.get("TICK_SECONDS", cls.tick_seconds))
+        """读取环境变量。缺失/非法一律抛 ConfigError，由 main 转成可诊断的存活态。"""
+        try:
+            tick_seconds = int(os.environ.get("TICK_SECONDS", cls.tick_seconds))
+        except ValueError as e:
+            raise ConfigError(f"TICK_SECONDS must be an integer: {e}") from e
         if tick_seconds < 60:
-            raise ValueError("TICK_SECONDS must be >= 60 (rate limit assumes one drain per minute)")
+            raise ConfigError(
+                "TICK_SECONDS must be >= 60 (rate limit assumes one drain per minute)")
+
+        token = next((os.environ[k] for k in TOKEN_ENV_VARS if os.environ.get(k)), "")
+        if not token:
+            raise ConfigError(
+                "missing platform credential: set EXTERNAL_SERVICE_TOKEN "
+                "(injected by the platform) or XC_TOKEN for local runs")
+        strategy_id = os.environ.get("STRATEGY_ID", "")
+        if not strategy_id:
+            raise ConfigError("missing STRATEGY_ID (the platform injects it at runtime)")
+
         return cls(
-            xc_token=os.environ["XC_TOKEN"],
-            strategy_id=os.environ["STRATEGY_ID"],
-            base_url=os.environ["MODELHUB_BASE_URL"],
+            xc_token=token,
+            strategy_id=strategy_id,
+            base_url=os.environ.get("MODELHUB_BASE_URL") or DEFAULT_BASE_URL,
+            dry_run=os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes"),
             storage_path=os.environ.get("STORAGE_PATH", cls.storage_path),
             tick_seconds=tick_seconds,
             max_submits_per_minute=int(

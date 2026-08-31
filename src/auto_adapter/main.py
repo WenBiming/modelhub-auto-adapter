@@ -23,7 +23,7 @@ from .discovery.huggingface import HuggingFaceSource
 from .eligibility import Verdict
 from .models import Priority, TaskRecord, TaskStatus
 from .platform_client import PlatformClient
-from .settings import Settings
+from .settings import ConfigError, Settings
 from .storage import SqliteStorage
 from .storage.base import DuplicateTaskError
 
@@ -50,13 +50,41 @@ def run_loop(tick_fn, stop_event: threading.Event, interval_seconds: float) -> N
         stop_event.wait(interval_seconds)
 
 
+def _idle_until_stopped(stop_event: threading.Event, reason: str) -> None:
+    """配置不可用时保持存活并周期性复述原因，直到 SIGTERM。
+
+    平台看到的是一个健康但明显在报错的 Pod，日志里每分钟一条原因——比崩溃三次后
+    只剩一个"失败"状态可诊断得多。绝不在此状态下做任何平台调用。
+    """
+    while not stop_event.is_set():
+        logger.error("agent idle: %s (fix the environment and restart)", reason)
+        stop_event.wait(60)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    settings = Settings.from_env()
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+
+    # 健康检查必须先于配置校验启动：平台 livenessProbe 探不到 /health 就重启 Pod，
+    # 三次后直接标记失败——配置写错时那等于什么诊断信息都拿不到。先起来，再校验，
+    # 校验失败就"存活但不工作"，把原因写进 / 端点和日志（见下）。
     health.start_in_background(port=8080)
+
+    try:
+        settings = Settings.from_env()
+    except ConfigError as e:
+        health.set_state(status="misconfigured", config_error=str(e))
+        logger.error("configuration error: %s", e)
+        _idle_until_stopped(stop_event, str(e))
+        return
+
+    health.set_state(status="running", config_error=None, dry_run=settings.dry_run)
+    if settings.dry_run:
+        logger.warning(
+            "DRY RUN enabled: the agent will discover, dedup and build requests, "
+            "but will NOT submit anything to the platform")
     deps = build_deps(settings)
     run_loop(lambda: tick(deps, stop_event), stop_event, settings.tick_seconds)
 

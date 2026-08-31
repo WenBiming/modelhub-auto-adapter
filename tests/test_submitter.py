@@ -262,3 +262,48 @@ def test_naive_bounty_deadline_does_not_crash_drain(store):
     client.add_task.side_effect = [1, 2]
 
     assert submitter.drain(store, client, SETTINGS, now=NOW) == 2
+
+
+DRY_SETTINGS = Settings(xc_token="t", strategy_id="s", base_url="https://x",
+                        max_submits_per_minute=2, max_inflight=3, dry_run=True)
+
+
+def test_dry_run_never_calls_add_task(store):
+    """演练模式必须走完组装、按限流节奏挑出记录，但一个平台请求都不发。"""
+    store.insert_task(_queued("org/a"))
+    store.insert_task(_queued("org/b"))
+    client = Mock()
+
+    assert submitter.drain(store, client, DRY_SETTINGS, now=NOW) == 2
+    client.add_task.assert_not_called()
+
+
+def test_dry_run_leaves_records_queued_with_no_task_id(store):
+    """绝不能伪造 PENDING/task_id：monitor 对账时会在平台侧找不到它，
+    误判为"任务被平台清理"从而拉下熔断闸——演练反而制造事故。"""
+    store.insert_task(_queued("org/a"))
+
+    submitter.drain(store, Mock(), DRY_SETTINGS, now=NOW)
+
+    rec = store.get_task("org/a", "MetaX_c-500")
+    assert rec.status == TaskStatus.QUEUED
+    assert rec.task_id is None and rec.submit_time is None
+
+
+def test_dry_run_respects_rate_limit(store):
+    """演练的节奏要与真实运行一致，否则看到的行为不能代表上线后的行为。"""
+    for i in range(5):
+        store.insert_task(_queued(f"org/m{i}"))
+    assert submitter.drain(store, Mock(), DRY_SETTINGS, now=NOW) == 2  # max_submits_per_minute
+
+
+def test_dry_run_logs_the_intended_request_once(store, caplog):
+    store.insert_task(_queued("org/a"))
+    with caplog.at_level("INFO"):
+        submitter.drain(store, Mock(), DRY_SETTINGS, now=NOW)
+        first = caplog.text.count("DRY RUN would submit")
+        submitter.drain(store, Mock(), DRY_SETTINGS, now=NOW)
+        second = caplog.text.count("DRY RUN would submit")
+    assert first == 1
+    assert second == 1  # 同一 (model_id, target_gpu) 不再刷屏
+    assert "org/a" in caplog.text
