@@ -20,6 +20,7 @@ from . import config_gen, eligibility, failure, health, metrics, monitor, submit
 from .discovery import base as discovery
 from .discovery.bounty import ManualBountySource
 from .discovery.huggingface import HuggingFaceSource
+from .discovery.modelscope import ModelScopeSource
 from .eligibility import Verdict
 from .models import Priority, TaskRecord, TaskStatus
 from .platform_client import PlatformClient, escalate_if_credential_error
@@ -95,28 +96,49 @@ def main() -> None:
         _idle_until_stopped(stop_event, str(e))
         return
 
-    _adopt_in_flight_tasks(deps)
+    _adopt_in_flight_tasks(deps)  # 失败不阻塞启动：每个 tick 会重试并在成功后自动解闸
     health.set_state(status="running", config_error=None, dry_run=settings.dry_run)
     run_loop(lambda: tick(deps, stop_event), stop_event, settings.tick_seconds)
 
 
-def _adopt_in_flight_tasks(deps: "Deps") -> None:
-    """启动时认领平台上仍在途的任务（容器存储是临时的，见 monitor 内文档）。
+ADOPTION_SOURCE = "startup_adoption"
 
-    认领不成功（平台不可达或只读到部分名单）时**拉下熔断闸**：本地是空表而平台
-    可能有在途任务，此时放行提交就等于赌"没有重复"——而平台对重复提交的处理是
-    清空账号全部任务。等下次启动或人工确认后再放行。
+
+def _adopt_in_flight_tasks(deps: "Deps") -> bool:
+    """认领平台上仍在途的任务，返回是否确认成功（容器存储是临时的，见 monitor）。
+
+    确认不了（平台不可达或只读到部分名单）就拉下熔断闸：本地是空表而平台可能有在途
+    任务，此时放行提交等于赌"没有重复"，而平台对重复提交的处理是清空账号全部任务。
+
+    确认成功且当前闸门正是本函数拉的 → 自动解除。这一步很重要：认领原先只在启动时
+    跑一次，网络抖一下就把智能体永久锁死，只能靠重启恢复。"暂时不可知"和"出事了"
+    必须区别对待——前者自愈，后者等人。
     """
+    credential_failure = False
     try:
         adopted = monitor.adopt_orphaned_platform_tasks(deps.storage, deps.client)
     except Exception as e:
-        escalate_if_credential_error(deps.storage, e)
-        logger.exception("startup adoption failed; pausing submissions until reconciled")
+        credential_failure = escalate_if_credential_error(deps.storage, e)
+        logger.error("adoption failed; submissions stay paused until reconciled: %s", e)
         adopted = -1
+
     if adopted < 0:
+        if credential_failure:
+            # 凭据错误已经拉过闸并写明了原因。再覆盖成通用的"认领失败"会做两件坏事：
+            # 抹掉更精确的根因，并把它降级成可自动解除——令牌无效要人换令牌，
+            # 自动重试一万次也不会好。
+            return False
         deps.storage.set_kill_switch(
-            True, "startup: could not confirm in-flight platform tasks; "
-                  "submissions paused to avoid duplicates after a storage reset")
+            True, "could not confirm in-flight platform tasks; submissions paused "
+                  "to avoid duplicates after a storage reset",
+            source=ADOPTION_SOURCE)
+        return False
+
+    state = deps.storage.kill_switch_state()
+    if state["on"] and state.get("source") == ADOPTION_SOURCE:
+        deps.storage.set_kill_switch(False, "in-flight platform tasks confirmed", source="")
+        logger.warning("platform state confirmed; releasing the adoption kill switch")
+    return True
 
 
 @dataclass
@@ -136,9 +158,12 @@ def build_deps(settings: Settings) -> Deps:
     """
     storage = SqliteStorage(settings.storage_path)
     sources = [ManualBountySource(settings.bounty_config_path)]
+    if settings.modelscope_discovery_enabled:
+        # 平台内网连不上 huggingface.co，ModelScope 是那里唯一可达的模型源。
+        sources.append(ModelScopeSource(storage, limit=settings.hf_fetch_limit))
     if settings.hf_discovery_enabled:
-        # storage 注入：HF 的 1h 节流时间戳必须落盘，否则崩溃重启循环会每次重启
-        # 都打一遍 HuggingFace（CLAUDE.md：禁止业务模块自建内存态）。
+        # storage 注入：1h 节流时间戳必须落盘，否则崩溃重启循环会每次重启
+        # 都打一遍上游（CLAUDE.md：禁止业务模块自建内存态）。
         sources.append(HuggingFaceSource(storage, limit=settings.hf_fetch_limit))
     return Deps(
         settings=settings,
@@ -170,6 +195,11 @@ def tick(deps: Deps, stop_event: threading.Event) -> None:
 
 
 def _tick_body(s: Deps, stop_event: threading.Event) -> None:
+    # 上一轮没能确认平台状态时，每个 tick 再试一次并在成功后自动解闸——
+    # 一次网络抖动不该让智能体永久停摆。
+    state = s.storage.kill_switch_state()
+    if state["on"] and state.get("source") == ADOPTION_SOURCE:
+        _adopt_in_flight_tasks(s)
     metrics.incr("candidates_discovered", discovery.run(s.sources, s.storage))
     target_gpu = config_gen.select_target_gpu(s.storage)  # 覆盖率缓存 loop 内不变，提前一次读取
     pending = s.storage.pending_candidates()

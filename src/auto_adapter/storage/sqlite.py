@@ -167,8 +167,15 @@ class SqliteStorage:
         return self.kill_switch_state()["on"]
 
     def kill_switch_state(self) -> dict:
-        state = self._kv_get("kill_switch", {"on": False, "reason": ""})
-        return {"on": bool(state.get("on")), "reason": state.get("reason", "")}
+        state = self._kv_get("kill_switch", {"on": False, "reason": "", "source": ""})
+        return {"on": bool(state.get("on")), "reason": state.get("reason", ""),
+                "source": state.get("source", "")}
 
-    def set_kill_switch(self, on: bool, reason: str) -> None:
-        self._kv_set("kill_switch", {"on": on, "reason": reason})
+    def set_kill_switch(self, on: bool, reason: str, source: str = "") -> None:
+        """source 标注是谁拉的闸，决定它能否自动解除。
+
+        "startup_adoption" 是唯一可自动解除的来源：它表示"这一刻无法确认平台在途
+        任务"，属于暂时不可知，认领成功后就该放行。其余来源（凭据失效、任务疑似被
+        平台清理、连续引擎失败）都意味着有事情需要人看一眼，绝不自动解除。
+        """
+        self._kv_set("kill_switch", {"on": on, "reason": reason, "source": source})

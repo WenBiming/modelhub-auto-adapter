@@ -39,6 +39,7 @@ class Settings:
     bounty_config_path: str = ""
     hf_fetch_limit: int = 50
     hf_discovery_enabled: bool = True
+    modelscope_discovery_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -79,5 +80,8 @@ class Settings:
             hf_fetch_limit=int(os.environ.get("HF_FETCH_LIMIT", cls.hf_fetch_limit)),
             hf_discovery_enabled=os.environ.get(
                 "HF_DISCOVERY_ENABLED", str(cls.hf_discovery_enabled)
+            ).strip().lower() not in ("false", "0"),
+            modelscope_discovery_enabled=os.environ.get(
+                "MODELSCOPE_DISCOVERY_ENABLED", str(cls.modelscope_discovery_enabled)
             ).strip().lower() not in ("false", "0"),
         )

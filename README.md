@@ -50,6 +50,21 @@ docker run -p 8080:8080 \
 等）的默认值只能写在 Dockerfile 的 `ENV` 里——改完重新打 tag 即可生效。
 **凭据绝不要写进 Dockerfile**：镜像层是明文且随仓库分发。
 
+### 模型来源：平台内网连不上 HuggingFace
+
+线上实测 `huggingface.co` connect timeout。默认来源因此改为 **ModelScope**
+（`MODELSCOPE_DISCOVERY_ENABLED=true`，HF 默认关闭）——平台自己 API 文档的样例
+用的也是 modelscope.cn 的地址。若你的环境有 HF 镜像，设 `HF_ENDPOINT` 再打开 HF。
+
+### 鉴权：EXTERNAL_SERVICE_TOKEN 未必等于开放平台的 xcToken
+
+线上实测：平台注入的 `EXTERNAL_SERVICE_TOKEN` 以 `Xc-Token` 头调开放平台 API 会被
+**401 拒绝**。官方 demo 只检查该变量是否存在，从不拿它调 API，所以文档没有回答
+"智能体该用什么令牌调开放平台"这个问题。
+
+`AUTH_HEADER` 可在不改代码的情况下换鉴权头名（默认 `Xc-Token`）便于排查。
+凭据无效时熔断闸会拉起且**不会自动解除**——重试一万次也修不好一个无效令牌。
+
 ### 存储是临时的
 
 平台不挂载持久卷（默认 `/data` 在容器里根本不存在，线上会报

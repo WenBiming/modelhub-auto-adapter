@@ -1,6 +1,7 @@
 """HuggingFace Hub 发现源：按 downloads/trending/pipeline_tag 筛选。M3 实现。"""
 from __future__ import annotations
 
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -9,7 +10,13 @@ import requests
 
 from ..models import CandidateModel
 
-_API = "https://huggingface.co/api/models"
+# 平台内网连不上 huggingface.co（线上实测 connect timeout）。HF_ENDPOINT 是 HF 生态
+# 的既有约定（hf-mirror.com 等镜像都认这个变量），留出替换入口而不写死镜像地址。
+_DEFAULT_ENDPOINT = "https://huggingface.co"
+
+
+def _api_url() -> str:
+    return os.environ.get("HF_ENDPOINT", _DEFAULT_ENDPOINT).rstrip("/") + "/api/models"
 _PARAMS_RE = re.compile(r"(\d+(?:\.\d+)?)[bB]\b")
 
 # 上次成功拉取的墙钟时间戳（epoch 秒），存 storage 的 kv 计数器（跨进程重启有效）。
@@ -31,7 +38,7 @@ class HuggingFaceSource:
         last_fetch = self._storage.get_counter(LAST_FETCH_KEY)
         if last_fetch and 0 <= now - last_fetch < self._min_interval:
             return []
-        resp = requests.get(_API, params={
+        resp = requests.get(_api_url(), params={
             "sort": "downloads", "direction": -1,
             "limit": self._limit, "pipeline_tag": "text-generation",
         }, timeout=10)

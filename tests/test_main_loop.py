@@ -70,3 +70,72 @@ def test_health_status_endpoint_reports_config_error():
     assert client.get("/health").status_code == 200  # 合规要求：存活即 200
     body = client.get("/").get_json()
     assert body["status"] == "misconfigured" and body["config_error"] == "missing X"
+
+
+def test_adoption_kill_switch_releases_itself_once_confirmed(tmp_path):
+    """认领原先只在启动跑一次：网络抖一下就把智能体永久锁死，只能重启。
+    "暂时不可知"必须能自愈，"出事了"才等人。"""
+    from unittest.mock import Mock, patch
+
+    from auto_adapter.main import ADOPTION_SOURCE, Deps, _adopt_in_flight_tasks
+    from auto_adapter.settings import Settings
+    from auto_adapter.storage.sqlite import SqliteStorage
+
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    deps = Deps(settings=Settings(xc_token="t", strategy_id="s"),
+                storage=storage, client=Mock(), sources=[])
+
+    with patch("auto_adapter.monitor.adopt_orphaned_platform_tasks", return_value=-1):
+        assert _adopt_in_flight_tasks(deps) is False
+    state = storage.kill_switch_state()
+    assert state["on"] and state["source"] == ADOPTION_SOURCE
+
+    with patch("auto_adapter.monitor.adopt_orphaned_platform_tasks", return_value=0):
+        assert _adopt_in_flight_tasks(deps) is True
+    assert storage.kill_switch() is False  # 自愈
+
+
+def test_adoption_never_releases_a_switch_it_did_not_set(tmp_path):
+    """凭据失效/任务疑似被清理拉的闸绝不能被认领成功顺手解除——那些要人看一眼。"""
+    from unittest.mock import Mock, patch
+
+    from auto_adapter.main import Deps, _adopt_in_flight_tasks
+    from auto_adapter.settings import Settings
+    from auto_adapter.storage.sqlite import SqliteStorage
+
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    storage.set_kill_switch(True, "task 42 vanished from platform", source="vanish")
+    deps = Deps(settings=Settings(xc_token="t", strategy_id="s"),
+                storage=storage, client=Mock(), sources=[])
+
+    with patch("auto_adapter.monitor.adopt_orphaned_platform_tasks", return_value=3):
+        _adopt_in_flight_tasks(deps)
+
+    assert storage.kill_switch() is True
+    assert storage.kill_switch_state()["source"] == "vanish"
+
+
+def test_credential_failure_is_not_downgraded_to_auto_releasable(tmp_path):
+    """凭据失效拉的闸必须保留其原因、且不可自动解除：令牌无效重试一万次也不会好，
+    要人去换令牌。早先通用的"认领失败"会覆盖掉更精确的根因并把它降级。"""
+    from unittest.mock import Mock, patch
+
+    import requests
+
+    from auto_adapter.main import ADOPTION_SOURCE, Deps, _adopt_in_flight_tasks
+    from auto_adapter.settings import Settings
+    from auto_adapter.storage.sqlite import SqliteStorage
+
+    storage = SqliteStorage(str(tmp_path / "t.db"))
+    deps = Deps(settings=Settings(xc_token="t", strategy_id="s"),
+                storage=storage, client=Mock(), sources=[])
+
+    err = requests.HTTPError("401 Client Error")
+    err.response = Mock(status_code=401)
+    with patch("auto_adapter.monitor.adopt_orphaned_platform_tasks", side_effect=err):
+        assert _adopt_in_flight_tasks(deps) is False
+
+    state = storage.kill_switch_state()
+    assert state["on"] is True
+    assert "credential" in state["reason"].lower()
+    assert state["source"] != ADOPTION_SOURCE  # 不可自动解除

@@ -7,6 +7,7 @@ M2 里程碑实现。所有方法 HTTP 超时 ≤ 10s（优雅停机要求）。
 from __future__ import annotations
 
 import logging
+import os
 
 import requests
 
@@ -15,6 +16,11 @@ from .models import AddTaskRequest, ModelSearchResult
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 10
+
+# 平台开放平台 API 的鉴权头。文档写明是 Xc-Token，但平台注入给智能体的
+# EXTERNAL_SERVICE_TOKEN 未必就是同一种令牌（线上实测被 401 拒绝）——留一个不改代码
+# 就能换头名的口子，便于排查。值本身永远不进日志。
+AUTH_HEADER = os.environ.get("AUTH_HEADER", "Xc-Token")
 
 # 附录 A.6 错误码
 CODE_OK = 0
@@ -84,7 +90,11 @@ def escalate_if_credential_error(storage, exc: BaseException) -> bool:
         storage.set_kill_switch(True, f"credential error from platform: {exc}")
     except Exception:
         logger.exception("failed to persist kill switch after credential error")
-    logger.error("credential error from platform (%s); kill switch ON", exc)
+    logger.error(
+        "credential error from platform (%s); kill switch ON. "
+        "The agent sent header %r; if the platform injected EXTERNAL_SERVICE_TOKEN is not "
+        "an open-API xcToken, set AUTH_HEADER or supply a valid token — retrying will not "
+        "fix an invalid credential.", exc, AUTH_HEADER)
     return True
 
 
@@ -92,7 +102,7 @@ class PlatformClient:
     def __init__(self, base_url: str, xc_token: str) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = requests.Session()
-        self._session.headers["Xc-Token"] = xc_token
+        self._session.headers[AUTH_HEADER] = xc_token
 
     def _request(self, method: str, path: str, *, params=None, json_body=None):
         resp = self._session.request(

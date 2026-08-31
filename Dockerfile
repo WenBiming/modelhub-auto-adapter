@@ -21,6 +21,11 @@ ENV STORAGE_PATH=/app/data/agent.db
 # 验证通过后把这一行改成 false（或删掉）再发一个新 tag。
 ENV DRY_RUN=true
 
+# 平台内网连不上 huggingface.co（线上实测 connect timeout），默认关闭该来源，
+# 只用国内可达的 ModelScope。若你的环境有 HF 镜像，设 HF_ENDPOINT 后再打开。
+ENV HF_DISCOVERY_ENABLED=false
+ENV MODELSCOPE_DISCOVERY_ENABLED=true
+
 RUN mkdir -p /app/data
 
 EXPOSE 8080

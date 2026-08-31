@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+
+import requests
 from typing import Protocol
 
 from ..models import CandidateModel
@@ -32,6 +34,11 @@ def run(sources: list[DiscoverySource], storage) -> int:
     for src in sources:
         try:
             candidates = src.fetch()
+        except requests.RequestException as e:
+            # 上游不可达是可预期的常态（平台内网连不上 huggingface.co），
+            # 每个 tick 打一整页 traceback 只会淹没真正的信号。
+            logger.warning("discovery source %s unreachable: %s", src.name, e)
+            continue
         except Exception:
             logger.exception("discovery source %s failed", src.name)
             continue
