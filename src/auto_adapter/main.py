@@ -22,9 +22,9 @@ from .discovery.bounty import ManualBountySource
 from .discovery.huggingface import HuggingFaceSource
 from .eligibility import Verdict
 from .models import Priority, TaskRecord, TaskStatus
-from .platform_client import PlatformClient
+from .platform_client import PlatformClient, escalate_if_credential_error
 from .settings import ConfigError, Settings
-from .storage import SqliteStorage
+from .storage import SqliteStorage, StorageUnavailableError
 from .storage.base import DuplicateTaskError
 
 logger = logging.getLogger(__name__)
@@ -80,13 +80,43 @@ def main() -> None:
         _idle_until_stopped(stop_event, str(e))
         return
 
-    health.set_state(status="running", config_error=None, dry_run=settings.dry_run)
     if settings.dry_run:
         logger.warning(
             "DRY RUN enabled: the agent will discover, dedup and build requests, "
             "but will NOT submit anything to the platform")
-    deps = build_deps(settings)
+
+    # 存储打不开（平台未挂卷、路径不可写）同样不能崩：崩了只剩重启循环，
+    # 平台三次后标记失败，运维看不到 "unable to open database file" 之外的线索。
+    try:
+        deps = build_deps(settings)
+    except StorageUnavailableError as e:
+        health.set_state(status="storage-unavailable", config_error=str(e))
+        logger.error("storage unavailable: %s", e)
+        _idle_until_stopped(stop_event, str(e))
+        return
+
+    _adopt_in_flight_tasks(deps)
+    health.set_state(status="running", config_error=None, dry_run=settings.dry_run)
     run_loop(lambda: tick(deps, stop_event), stop_event, settings.tick_seconds)
+
+
+def _adopt_in_flight_tasks(deps: "Deps") -> None:
+    """启动时认领平台上仍在途的任务（容器存储是临时的，见 monitor 内文档）。
+
+    认领不成功（平台不可达或只读到部分名单）时**拉下熔断闸**：本地是空表而平台
+    可能有在途任务，此时放行提交就等于赌"没有重复"——而平台对重复提交的处理是
+    清空账号全部任务。等下次启动或人工确认后再放行。
+    """
+    try:
+        adopted = monitor.adopt_orphaned_platform_tasks(deps.storage, deps.client)
+    except Exception as e:
+        escalate_if_credential_error(deps.storage, e)
+        logger.exception("startup adoption failed; pausing submissions until reconciled")
+        adopted = -1
+    if adopted < 0:
+        deps.storage.set_kill_switch(
+            True, "startup: could not confirm in-flight platform tasks; "
+                  "submissions paused to avoid duplicates after a storage reset")
 
 
 @dataclass

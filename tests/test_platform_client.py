@@ -1,4 +1,5 @@
 import pytest
+import requests
 import responses
 
 from auto_adapter.models import AddTaskRequest
@@ -81,3 +82,31 @@ def test_get_task_log_and_stop_tasks(client):
     assert client.stop_tasks([1, 2]) is True
     import json as _json
     assert _json.loads(responses.calls[1].request.body) == {"taskIds": [1, 2]}
+
+
+def test_http_401_counts_as_a_credential_failure():
+    """线上实测：令牌无效时平台在 HTTP 层返回 401，raise_for_status 抛 HTTPError，
+    走不到业务码 40100。只认业务码会让令牌过期这种最该拉闸的情形静默滑过去。"""
+    from unittest.mock import Mock as _Mock
+
+    from auto_adapter.platform_client import escalate_if_credential_error
+
+    storage = _Mock()
+    exc = requests.HTTPError("401 Client Error")
+    exc.response = _Mock(status_code=401)
+
+    assert escalate_if_credential_error(storage, exc) is True
+    storage.set_kill_switch.assert_called_once()
+
+
+def test_ordinary_http_error_is_not_a_credential_failure():
+    from unittest.mock import Mock as _Mock
+
+    from auto_adapter.platform_client import escalate_if_credential_error
+
+    storage = _Mock()
+    exc = requests.HTTPError("500 Server Error")
+    exc.response = _Mock(status_code=500)
+
+    assert escalate_if_credential_error(storage, exc) is False
+    storage.set_kill_switch.assert_not_called()

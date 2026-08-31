@@ -49,3 +49,11 @@ class Storage(Protocol):
 
 class DuplicateTaskError(Exception):
     """违反 (model_id, target_gpu) 唯一性——防重复提交的最终防线。"""
+
+
+class StorageUnavailableError(Exception):
+    """存储无法打开（目录不存在/不可写）。
+
+    平台不保证挂载任何卷，容器里的默认路径可能根本不存在。由 main 捕获后转成
+    "存活但不工作"，而不是让进程崩掉、把诊断信息埋进重启循环里。
+    """

@@ -401,3 +401,63 @@ def test_waiting_status_syncs_to_pending(store):
     monitor.poll(store, client, SETTINGS, now=NOW)
 
     assert store.get_task("org/a", "MetaX_c-500").status == TaskStatus.PENDING
+
+
+def _plat_row(task_id, model_id, gpu, status="running", verify=1):
+    return {"taskId": task_id, "modelId": model_id, "gpuType": gpu,
+            "status": status, "verifyResult": verify,
+            "updateTime": "2026-08-29 11:00:00"}
+
+
+def test_adoption_reclaims_in_flight_tasks_after_storage_reset(store):
+    """容器存储是临时的：Pod 重启后本地任务表清零，而平台上 waiting/running 的任务
+    还在跑。不认领回来，下个 tick 会重新发现同一模型——而**在跑的任务不会出现在
+    search_model 的已完成结果里**——去重放行，同一 (model_id, gpu) 被提交第二次。"""
+    client = Mock()
+    client.list_my_tasks.return_value = {
+        "records": [_plat_row(501, "org/running", "MetaX_c-500", "running"),
+                    _plat_row(502, "org/queued", "Ascend_910-b4", "waiting")],
+        "total": 2, "current": 1, "pages": 1, "size": 100}
+
+    assert monitor.adopt_orphaned_platform_tasks(store, client) == 2
+
+    assert store.get_task("org/running", "MetaX_c-500").task_id == 501
+    assert store.get_task("org/queued", "Ascend_910-b4").status == TaskStatus.PENDING
+
+
+def test_adoption_ignores_finished_tasks(store):
+    """已完成的任务不重建：它们由 eligibility 查 search_model 覆盖到，
+    在本地凭空造记录反而会挡住合法的重新适配。"""
+    client = Mock()
+    client.list_my_tasks.return_value = {
+        "records": [_plat_row(601, "org/done", "MetaX_c-500", "success", 1),
+                    _plat_row(602, "org/failed", "MetaX_c-500", "success", -1)],
+        "total": 2, "current": 1, "pages": 1, "size": 100}
+
+    assert monitor.adopt_orphaned_platform_tasks(store, client) == 0
+    assert store.get_task("org/done", "MetaX_c-500") is None
+
+
+def test_adoption_reports_unconfirmed_on_partial_enumeration(store):
+    """只读到半份名单时返回 -1（未能确认），调用方据此拉闸暂停提交——
+    宁可这一轮不提交，也不能在"可能有在途任务"的状态下放行。"""
+    client = Mock()
+    client.list_my_tasks.side_effect = [
+        {"records": [_plat_row(701, "org/a", "MetaX_c-500")],
+         "total": 200, "current": 1, "pages": 3, "size": 100},
+        ConnectionError("page 2 down"),
+    ]
+
+    assert monitor.adopt_orphaned_platform_tasks(store, client) == -1
+    assert store.get_task("org/a", "MetaX_c-500") is None  # 半份名单不做任何认领
+
+
+def test_adoption_does_not_clobber_existing_local_records(store):
+    store.insert_task(_pending("org/a", 999))
+    client = Mock()
+    client.list_my_tasks.return_value = {
+        "records": [_plat_row(888, "org/a", "MetaX_c-500")],
+        "total": 1, "current": 1, "pages": 1, "size": 100}
+
+    assert monitor.adopt_orphaned_platform_tasks(store, client) == 0
+    assert store.get_task("org/a", "MetaX_c-500").task_id == 999  # 本地记录优先

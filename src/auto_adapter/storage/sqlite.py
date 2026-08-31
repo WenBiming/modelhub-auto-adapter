@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime
 
 from ..models import CandidateModel, Priority, TaskRecord, TaskStatus
-from .base import DuplicateTaskError
+from .base import DuplicateTaskError, StorageUnavailableError
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidates (
@@ -60,8 +61,21 @@ def _load_candidate(payload: str) -> CandidateModel:
 
 class SqliteStorage:
     def __init__(self, path: str) -> None:
-        self._conn = sqlite3.connect(path)
-        self._conn.executescript(_SCHEMA)
+        # 父目录不一定存在：平台不保证挂载任何卷，早先默认的 /data 在容器里根本
+        # 没有，sqlite3.connect 只会抛一句 "unable to open database file"。
+        parent = os.path.dirname(os.path.abspath(path))
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            raise StorageUnavailableError(
+                f"cannot create storage directory {parent!r}: {e}") from e
+        try:
+            self._conn = sqlite3.connect(path)
+            self._conn.executescript(_SCHEMA)
+        except sqlite3.Error as e:
+            raise StorageUnavailableError(
+                f"cannot open database at {path!r}: {e} "
+                "(set STORAGE_PATH to a writable location)") from e
 
     def upsert_candidate(self, candidate: CandidateModel) -> None:
         with self._conn:

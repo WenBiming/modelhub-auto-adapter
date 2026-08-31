@@ -73,3 +73,27 @@ def test_candidate_flow(store, candidate):
     assert store.pending_candidates() == []
     store.upsert_candidate(candidate)  # 已处理的候选再 upsert 不复活
     assert store.pending_candidates() == []
+
+
+def test_creates_missing_parent_directory(tmp_path):
+    """平台不挂载卷，默认路径的父目录可能根本不存在——线上实测就是这里崩的
+    （sqlite3.OperationalError: unable to open database file）。"""
+    nested = tmp_path / "no" / "such" / "dir" / "agent.db"
+    store = SqliteStorage(str(nested))
+    store.set_counter("k", 1)
+    assert store.get_counter("k") == 1
+    assert nested.exists()
+
+
+def test_unwritable_path_raises_storage_unavailable(tmp_path):
+    """不可写时必须抛 StorageUnavailableError（由 main 转成"存活但不工作"），
+    而不是让裸 sqlite3 异常炸穿启动流程。"""
+    from auto_adapter.storage.base import StorageUnavailableError
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0o500)  # r-x：不能在其中创建文件
+    try:
+        with pytest.raises(StorageUnavailableError):
+            SqliteStorage(str(blocked / "sub" / "agent.db"))
+    finally:
+        blocked.chmod(0o700)

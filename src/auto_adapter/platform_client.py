@@ -57,6 +57,19 @@ class PlatformClientError(Exception):
         return not self.is_transient
 
 
+def _is_credential_failure(exc: BaseException) -> bool:
+    """凭据失效的两种形态：业务码 40100/40101，以及 HTTP 401/403。
+
+    线上实测：令牌无效时平台在 HTTP 层就返回 401，`raise_for_status()` 抛的是
+    requests.HTTPError，根本走不到业务码解析——只认业务码会让最该告警的情形
+    （令牌过期）静默退化成一个笼统的"接口失败"。
+    """
+    if isinstance(exc, PlatformClientError) and exc.is_credential_error:
+        return True
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) in (401, 403)
+
+
 def escalate_if_credential_error(storage, exc: BaseException) -> bool:
     """凭据错误（40100/40101）出现在任何阶段都必须拉闸，返回是否拉了闸。
 
@@ -65,7 +78,7 @@ def escalate_if_credential_error(storage, exc: BaseException) -> bool:
     调用方在每个通用 except 之前调用本函数。异常信息里只有平台返回的
     code/message，不含凭据本身（CLAUDE.md：凭据不写日志）。
     """
-    if not (isinstance(exc, PlatformClientError) and exc.is_credential_error):
+    if not _is_credential_failure(exc):
         return False
     try:
         storage.set_kill_switch(True, f"credential error from platform: {exc}")

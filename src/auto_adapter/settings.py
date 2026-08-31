@@ -11,6 +11,11 @@ from dataclasses import dataclass
 
 DEFAULT_BASE_URL = "https://modelhub.org.cn"
 
+# 平台不保证挂载任何卷，/data 在容器里根本不存在（线上实测 sqlite3 报
+# "unable to open database file"）。默认落在镜像自带、必定可写的目录；
+# 若运行环境挂了持久卷，用 STORAGE_PATH 指过去即可获得跨重启的持久化。
+DEFAULT_STORAGE_PATH = "/app/data/agent.db"
+
 # 平台注入的凭据变量名优先，其次是本地开发惯用名
 TOKEN_ENV_VARS = ("EXTERNAL_SERVICE_TOKEN", "XC_TOKEN")
 
@@ -25,7 +30,7 @@ class Settings:
     strategy_id: str
     base_url: str = DEFAULT_BASE_URL
     dry_run: bool = False
-    storage_path: str = "/data/agent.db"
+    storage_path: str = DEFAULT_STORAGE_PATH
     tick_seconds: int = 60
     max_submits_per_minute: int = 2
     max_inflight: int = 5

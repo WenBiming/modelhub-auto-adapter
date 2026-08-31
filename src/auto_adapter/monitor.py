@@ -7,10 +7,11 @@ from datetime import datetime, timedelta, timezone
 
 from . import rules
 from .failure import classify
-from .models import FailureKind, TaskRecord, TaskStatus, ensure_utc
+from .models import FailureKind, Priority, TaskRecord, TaskStatus, ensure_utc
 from .platform_client import PlatformClient, escalate_if_credential_error
 from .settings import Settings
 from .storage import Storage
+from .storage.base import DuplicateTaskError
 
 logger = logging.getLogger(__name__)
 
@@ -245,3 +246,52 @@ def poll(storage: Storage, client: PlatformClient, settings: Settings,
             storage.update_task(rec)
 
         _check_timeout(storage, rec, row, now, timeout)
+
+
+def adopt_orphaned_platform_tasks(storage: Storage, client: PlatformClient) -> int:
+    """启动时把平台上仍在途的任务认领回本地任务表，返回认领条数。
+
+    为什么必须有这一步：平台不保证挂载持久卷，容器存储是临时的。Pod 一重启，
+    本地任务表清零，而平台上那些 waiting/running 的任务还在跑。下一个 tick 会
+    重新发现同一模型，去问 search_model——**正在跑的任务不会出现在已完成的
+    verifyResult 里**，于是去重放行，同一 (model_id, target_gpu) 被提交第二次。
+    平台判定重复提交的处理是清空账号下全部任务。
+
+    只认领活跃态（waiting/running）：已完成的任务由 eligibility 查 search_model
+    覆盖得到，不需要也不应该在本地重建。
+
+    枚举不完整（truncated/failed）时**不做任何认领**并返回 0——宁可这一轮不认领
+    （下个 tick 再来），也不能基于半份名单做判断。调用方据此决定是否放行提交。
+    """
+    platform_rows, outcome = _fetch_platform_rows(client, storage)
+    if outcome != "complete":
+        logger.warning(
+            "startup adoption skipped: platform listing %s; submissions stay paused "
+            "until a complete listing is read", outcome)
+        return -1  # 负数表示"未能确认"，与"确认了但一条都没有"区分开
+
+    adopted = 0
+    for task_id, row in platform_rows.items():
+        mapped = rules.map_platform_result(row.get("status"), row.get("verifyResult"))
+        if mapped not in (TaskStatus.PENDING, TaskStatus.RUNNING):
+            continue  # 只认领在途任务；已完成的靠 search_model 去重
+        model_id, gpu = row.get("modelId"), row.get("gpuType")
+        if not model_id or not gpu:
+            continue
+        if storage.get_task(model_id, gpu) is not None:
+            continue  # 本地已有记录，无需认领
+        try:
+            storage.insert_task(TaskRecord(
+                model_id=model_id, target_gpu=gpu,
+                framework="", status=mapped, priority=Priority.NEW_ADAPTATION,
+                task_id=int(task_id),
+                submit_time=_parse_platform_time(row.get("updateTime")),
+                model_url="", task_type=""))
+            adopted += 1
+        except DuplicateTaskError:
+            pass
+    if adopted:
+        logger.warning(
+            "adopted %d in-flight platform task(s) after a storage reset; "
+            "they will not be resubmitted", adopted)
+    return adopted
