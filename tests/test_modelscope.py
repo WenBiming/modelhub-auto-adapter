@@ -94,3 +94,31 @@ def test_only_configured_task_types_are_admitted(tmp_path):
     store = SqliteStorage(str(tmp_path / "t.db"))
     got = ModelScopeSource(store).fetch()  # 默认只收 text-generation
     assert [c.model_id for c in got] == ["org/textgen"]
+
+
+@responses.activate
+def test_pages_deeper_until_enough_candidates(tmp_path):
+    """一页 100 条只筛出个位数候选（"最新"与下载量门槛互相拉扯），
+    只看一页产出率太低，智能体大部分时间会空转。"""
+    page1 = _payload(*[_model("org", f"junk{i}", ["text-to-image-synthesis"], 1)
+                       for i in range(100)])
+    page2 = _payload(*([_model("org", "good-7B", ["text-generation"], 999)]
+                       + [_model("org", f"junk2-{i}", ["text-generation"], 1)
+                          for i in range(99)]))
+    responses.put(_API, json=page1)
+    responses.put(_API, json=page2)
+    store = SqliteStorage(str(tmp_path / "t.db"))
+
+    got = ModelScopeSource(store, limit=1).fetch()
+
+    assert [c.model_id for c in got] == ["org/good-7B"]
+    assert len(responses.calls) == 2  # 第一页不够，翻到第二页；够了就收手
+
+
+@responses.activate
+def test_stops_paging_at_the_end_of_the_list(tmp_path):
+    """返回不足一页说明翻到底了，不该继续空打上游。"""
+    responses.put(_API, json=_payload(_model("org", "only-7B", ["text-generation"], 999)))
+    store = SqliteStorage(str(tmp_path / "t.db"))
+    assert len(ModelScopeSource(store, limit=50).fetch()) == 1
+    assert len(responses.calls) == 1

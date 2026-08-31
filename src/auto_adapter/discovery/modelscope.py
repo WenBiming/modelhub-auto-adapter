@@ -35,9 +35,14 @@ _PARAMS_RE = re.compile(r"(\d+(?:\.\d+)?)[bB]\b")
 # 全是热门老模型，实测 17 个里 5 个所有可提交的卡都已适配、其余也只剩零星空位。
 _SORT_NEWEST = "GmtCreated"
 
-# 每次向 ModelScope 要多少条再客户端过滤。实测 100 条里约 17 条是 text-generation，
-# 取 200 是为了在 limit=50 时基本能填满，同时不至于一次拉太多。
-_FETCH_PAGE_SIZE = 200
+# 单页条数：实测传 200 也只返回 100，接口自身封顶。
+_FETCH_PAGE_SIZE = 100
+
+# 最多翻几页。"最新"和"下载量门槛"天然互相拉扯——今天刚发布的模型不可能有 50 次
+# 下载，能同时满足的是发布了几天到几周、刚积累起热度的那一段。实测第一页 100 条只
+# 筛出 2 个候选（11 条 text-generation，9 条没过门槛），只看一页产出率太低，智能体
+# 大部分时间会空转。往深翻几页才能覆盖到那一段。
+_MAX_PAGES = 5
 
 _THROTTLE_KEY = "modelscope_last_fetch"
 
@@ -54,18 +59,32 @@ class ModelScopeSource:
         self._min_interval = min_interval_seconds
         self._task_types = tuple(task_types)
 
+    def _admits(self, item: dict) -> bool:
+        """任务类型在配置内、且下载量过门槛。"""
+        tasks = [t.get("Name") for t in (item.get("Tasks") or [])]
+        task_type = next((t for t in tasks if t in self._task_types), None)
+        return task_type is not None and rules.passes_download_threshold(
+            task_type, item.get("Downloads"))
+
     def fetch(self) -> list[CandidateModel]:
         now = int(time.time())
         last = self._storage.get_counter(_THROTTLE_KEY)
         if last and now - last < self._min_interval:
             return []
 
-        resp = requests.put(_API, json={
-            "PageNumber": 1, "PageSize": _FETCH_PAGE_SIZE,
-            "SortBy": _SORT_NEWEST, "Target": "", "SingleCriterion": [],
-        }, timeout=10)
-        resp.raise_for_status()
-        models = (resp.json().get("Data") or {}).get("Model", {}).get("Models") or []
+        models: list[dict] = []
+        for page in range(1, _MAX_PAGES + 1):
+            resp = requests.put(_API, json={
+                "PageNumber": page, "PageSize": _FETCH_PAGE_SIZE,
+                "SortBy": _SORT_NEWEST, "Target": "", "SingleCriterion": [],
+            }, timeout=10)
+            resp.raise_for_status()
+            batch = (resp.json().get("Data") or {}).get("Model", {}).get("Models") or []
+            models.extend(batch)
+            if len(batch) < _FETCH_PAGE_SIZE:
+                break  # 翻到底了
+            if sum(1 for m in models if self._admits(m)) >= self._limit:
+                break  # 够了就别再打上游
         self._storage.set_counter(_THROTTLE_KEY, now)
 
         out: list[CandidateModel] = []
