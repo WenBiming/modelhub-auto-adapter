@@ -29,7 +29,7 @@ ENV DRY_RUN=false
 # ⚠️ 写进来的令牌会进入镜像层与 git 历史，**即使之后改掉也留在历史里**。
 #    因此：仓库必须保持 private；用完这个智能体后去平台重新生成一次令牌。
 #    换令牌只改这一行。
-ENV XC_TOKEN=
+ENV XC_TOKEN=751bbddc7b7b48428375909ab9d8824b
 
 # 平台内网连不上 huggingface.co（线上实测 connect timeout），默认关闭该来源，
 # 只用国内可达的 ModelScope。若你的环境有 HF 镜像，设 HF_ENDPOINT 后再打开。
