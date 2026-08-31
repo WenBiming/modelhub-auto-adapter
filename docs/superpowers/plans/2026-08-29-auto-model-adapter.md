@@ -1280,9 +1280,7 @@ def poll(storage, client, settings, now: datetime | None = None) -> None:
             logger.error("task %s vanished from platform; kill switch ON", rec.task_id)
             continue
         mapped = rules.map_platform_status(row.get("status"))
-        if mapped is None:
-            logger.warning("unknown platform status %r for task %s", row.get("status"), rec.task_id)
-        elif mapped == "failed":
+        if mapped == "failed":
             try:
                 rec.last_log = client.get_task_log(rec.task_id)
             except Exception:
@@ -1295,12 +1293,17 @@ def poll(storage, client, settings, now: datetime | None = None) -> None:
                           else TaskStatus.ENGINE_FAILED)
             storage.update_task(rec)
             continue
-        elif mapped != rec.status:
-            if mapped == TaskStatus.SUCCESS:
-                storage.set_counter("consecutive_engine_failures", 0)  # 成功即重置熔断计数
-            rec.status = mapped
+        if mapped == TaskStatus.SUCCESS:
+            storage.set_counter("consecutive_engine_failures", 0)  # 成功即重置熔断计数
+            rec.status = TaskStatus.SUCCESS
             storage.update_task(rec)
             continue
+        # 仍在活跃态（或状态未知）：先同步状态，再做超时判定（两者不互斥）
+        if mapped is None:
+            logger.warning("unknown platform status %r for task %s", row.get("status"), rec.task_id)
+        elif mapped != rec.status:
+            rec.status = mapped
+            storage.update_task(rec)
         if rec.submit_time is not None and now - rec.submit_time > timeout:
             rec.status = TaskStatus.TIMEOUT
             storage.update_task(rec)

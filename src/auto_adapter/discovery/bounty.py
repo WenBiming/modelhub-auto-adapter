@@ -1,18 +1,36 @@
-"""平台悬赏列表发现源——优先级最高，每 tick 执行。M3 实现。
+"""悬赏来源：平台无悬赏 API（spec §9），v0.1 用人工维护的 JSON 配置文件。
 
-依赖 platform_client.list_bounties()（真实 API 路径待确认，spec §9）。
+文件格式：[{"model_id": str, "model_url": str, "deadline": ISO8601}]
+
+deadline 由人手写，很容易漏掉时区偏移量（"2026-09-30T00:00:00"）。这里统一按 UTC
+归一化：naive datetime 一旦流进 submitter/failure 的时间比较就会抛 TypeError，
+让整条流水线每个 tick 都崩在同一处。
 """
-from __future__ import annotations
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
 
-from ..models import CandidateModel
-from ..platform_client import PlatformClient
+from ..models import CandidateModel, ensure_utc
+
+logger = logging.getLogger(__name__)
 
 
-class BountySource:
+class ManualBountySource:
     name = "bounty"
 
-    def __init__(self, client: PlatformClient) -> None:
-        self._client = client
+    def __init__(self, path: str) -> None:
+        self._path = Path(path) if path else None
 
     def fetch(self) -> list[CandidateModel]:
-        raise NotImplementedError
+        if self._path is None or not self._path.exists():
+            return []
+        items = json.loads(self._path.read_text())
+        return [CandidateModel(
+            source="bounty", model_id=i["model_id"], model_url=i["model_url"],
+            pipeline_tag=i.get("pipeline_tag"), params_size=i.get("params_size"),
+            is_bounty=True,
+            bounty_deadline=ensure_utc(
+                datetime.fromisoformat(i["deadline"])) if i.get("deadline") else None,
+            discovered_at=datetime.now(timezone.utc),
+        ) for i in items]

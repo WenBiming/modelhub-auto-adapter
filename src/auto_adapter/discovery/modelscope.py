@@ -1,4 +1,4 @@
-"""ModelScope 发现源。M3 实现。"""
+"""ModelScope 发现源（v0.1 范围外）。"""
 from __future__ import annotations
 
 from ..models import CandidateModel

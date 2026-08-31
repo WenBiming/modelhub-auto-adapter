@@ -12,6 +12,11 @@ class Storage(Protocol):
     def pending_candidates(self) -> list[CandidateModel]: ...
     def mark_candidate_processed(self, model_id: str) -> None: ...
 
+    def has_candidate(self, model_id: str) -> bool:
+        """候选表里是否已有该 model_id（含已 processed 的）——discovery.run 据此
+        只把真正新出现的候选计入 candidates_discovered。"""
+        ...
+
     # --- 任务表（唯一键 (model_id, target_gpu) 保证幂等，spec §3 不变式）---
     def insert_task(self, record: TaskRecord) -> None:
         """同 (model_id, target_gpu) 已存在活跃/成功/拉黑记录时抛 DuplicateTaskError。"""
@@ -31,6 +36,15 @@ class Storage(Protocol):
     # --- 熔断开关（monitor 发现对账异常时暂停提交）---
     def kill_switch(self) -> bool: ...
     def set_kill_switch(self, on: bool, reason: str) -> None: ...
+
+    def kill_switch_state(self) -> dict:
+        """{"on": bool, "reason": str}——每 tick 打进 metrics 日志行，让运维能看见
+        刹车状态和原因（清除方式见 README）。"""
+        ...
+
+    # --- 计数器（连续失败熔断用，Task 8/9 用）---
+    def get_counter(self, key: str) -> int: ...
+    def set_counter(self, key: str, value: int) -> None: ...
 
 
 class DuplicateTaskError(Exception):

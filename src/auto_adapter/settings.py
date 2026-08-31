@@ -16,15 +16,21 @@ class Settings:
     max_inflight: int = 5
     max_retries: int = 3
     task_timeout_hours: int = 6
+    bounty_config_path: str = ""
+    hf_fetch_limit: int = 50
+    hf_discovery_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
+        tick_seconds = int(os.environ.get("TICK_SECONDS", cls.tick_seconds))
+        if tick_seconds < 60:
+            raise ValueError("TICK_SECONDS must be >= 60 (rate limit assumes one drain per minute)")
         return cls(
             xc_token=os.environ["XC_TOKEN"],
             strategy_id=os.environ["STRATEGY_ID"],
             base_url=os.environ["MODELHUB_BASE_URL"],
             storage_path=os.environ.get("STORAGE_PATH", cls.storage_path),
-            tick_seconds=int(os.environ.get("TICK_SECONDS", cls.tick_seconds)),
+            tick_seconds=tick_seconds,
             max_submits_per_minute=int(
                 os.environ.get("MAX_SUBMITS_PER_MINUTE", cls.max_submits_per_minute)
             ),
@@ -33,4 +39,9 @@ class Settings:
             task_timeout_hours=int(
                 os.environ.get("TASK_TIMEOUT_HOURS", cls.task_timeout_hours)
             ),
+            bounty_config_path=os.environ.get("BOUNTY_CONFIG_PATH", cls.bounty_config_path),
+            hf_fetch_limit=int(os.environ.get("HF_FETCH_LIMIT", cls.hf_fetch_limit)),
+            hf_discovery_enabled=os.environ.get(
+                "HF_DISCOVERY_ENABLED", str(cls.hf_discovery_enabled)
+            ).strip().lower() not in ("false", "0"),
         )

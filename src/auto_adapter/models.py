@@ -6,7 +6,20 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def ensure_utc(dt: datetime | None) -> datetime | None:
+    """把 naive datetime 视为 UTC；已带时区的原样返回；None 原样返回。
+
+    悬赏 deadline 来自人工维护的 JSON（discovery/bounty.py），很容易写成不带偏移量
+    的 "2026-09-30T00:00:00"。naive 与 aware datetime 相减/比较会抛 TypeError，
+    而 submitter.drain 与 failure.handle 都做这种比较——一条手写记录就足以让流水线
+    每个 tick 都崩在同一处。写入侧（fetch）与消费侧都过一遍本函数。
+    """
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 class Priority(enum.IntEnum):
@@ -64,6 +77,8 @@ class TaskRecord:
     retry_count: int = 0
     submit_time: datetime | None = None
     bounty_deadline: datetime | None = None
+    model_url: str = ""
+    task_type: str = ""
     last_log: str | None = None
 
 

@@ -1,9 +1,12 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
 .venv/
 .pytest_cache/
 data/
 *.db
 .env
 .DS_Store
+.superpowers/
