@@ -16,8 +16,12 @@ DEFAULT_BASE_URL = "https://modelhub.org.cn"
 # 若运行环境挂了持久卷，用 STORAGE_PATH 指过去即可获得跨重启的持久化。
 DEFAULT_STORAGE_PATH = "/app/data/agent.db"
 
-# 平台注入的凭据变量名优先，其次是本地开发惯用名
-TOKEN_ENV_VARS = ("EXTERNAL_SERVICE_TOKEN", "XC_TOKEN")
+# 凭据来源，按优先级从高到低。
+#
+# XC_TOKEN 在前是刻意的：平台注入的 EXTERNAL_SERVICE_TOKEN 被开放平台 API 以 401
+# 拒绝（线上实测），运维只能自行配一个有效的 xcToken——**显式配置必须能压过平台
+# 的默认注入**，否则那个无效令牌会一直盖掉你配的这个，而症状只是一句 401。
+TOKEN_ENV_VARS = ("XC_TOKEN", "EXTERNAL_SERVICE_TOKEN")
 
 
 class ConfigError(Exception):

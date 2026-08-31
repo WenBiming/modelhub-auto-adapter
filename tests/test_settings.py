@@ -63,11 +63,14 @@ def test_xc_token_still_works_for_local_runs(monkeypatch):
     assert Settings.from_env().xc_token == "local-token"
 
 
-def test_platform_token_takes_precedence(monkeypatch):
+def test_explicit_token_overrides_the_platform_injection(monkeypatch):
+    """平台注入的 EXTERNAL_SERVICE_TOKEN 被开放平台 API 以 401 拒绝（线上实测），
+    运维只能自配一个有效 xcToken。显式配置必须压过平台默认注入，否则那个无效令牌
+    会一直盖掉运维配的这个，而症状只是一句 401。"""
     _base_env(monkeypatch)
-    monkeypatch.setenv("XC_TOKEN", "local-token")
-    monkeypatch.setenv("EXTERNAL_SERVICE_TOKEN", "platform-token")
-    assert Settings.from_env().xc_token == "platform-token"
+    monkeypatch.setenv("EXTERNAL_SERVICE_TOKEN", "platform-token-that-401s")
+    monkeypatch.setenv("XC_TOKEN", "operator-supplied-token")
+    assert Settings.from_env().xc_token == "operator-supplied-token"
 
 
 def test_missing_credential_raises_config_error(monkeypatch):
