@@ -16,7 +16,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import config_gen, eligibility, failure, health, metrics, monitor, submitter
+from . import (config_gen, eligibility, failure, health, metrics, monitor, rules,
+               submitter)
 from .discovery import base as discovery
 from .discovery.bounty import ManualBountySource
 from .discovery.huggingface import HuggingFaceSource
@@ -201,7 +202,6 @@ def _tick_body(s: Deps, stop_event: threading.Event) -> None:
     if state["on"] and state.get("source") == ADOPTION_SOURCE:
         _adopt_in_flight_tasks(s)
     metrics.incr("candidates_discovered", discovery.run(s.sources, s.storage))
-    target_gpu = config_gen.select_target_gpu(s.storage)  # 覆盖率缓存 loop 内不变，提前一次读取
     pending = s.storage.pending_candidates()
     if len(pending) > MAX_CANDIDATES_PER_TICK:
         logger.info("evaluating %d of %d pending candidates this tick",
@@ -210,13 +210,14 @@ def _tick_body(s: Deps, stop_event: threading.Event) -> None:
     for cand in pending:
         if stop_event.is_set():
             return
-        decision = eligibility.evaluate(cand, target_gpu, s.storage, s.client)
+        decision = eligibility.evaluate(cand, s.storage, s.client)
         if decision.verdict == Verdict.SKIP_UNCERTAIN:
             metrics.incr("skipped_uncertain")
-            _note_uncertain(s, cand, target_gpu)
+            _note_uncertain(s, cand)
             continue  # （未到上限时）不标记 processed，下个 tick 重试
         _clear_uncertain(s, cand)
         if decision.verdict == Verdict.ENQUEUE:
+            target_gpu = decision.target_gpu  # eligibility 为这个候选选中的卡
             try:
                 req = config_gen.build_request(cand, target_gpu, s.settings.strategy_id)
             except config_gen.UnresolvableCandidateError as e:
@@ -275,7 +276,7 @@ def _uncertain_key(model_id: str) -> str:
     return f"uncertain:{model_id}"
 
 
-def _note_uncertain(s: Deps, cand, target_gpu: str) -> None:
+def _note_uncertain(s: Deps, cand) -> None:
     """记一次"平台查不出结果"，连续 MAX_UNCERTAIN_TICKS 次后放行队列。
 
     SKIP_UNCERTAIN 的候选不标 processed（宁漏勿重：查不清就不提交），但候选循环每个
@@ -294,7 +295,10 @@ def _note_uncertain(s: Deps, cand, target_gpu: str) -> None:
     if streak < MAX_UNCERTAIN_TICKS:
         return
     priority = Priority.BOUNTY if cand.is_bounty else Priority.NEW_MODEL
-    _needs_human_record(s, cand, target_gpu, priority)
+    # 平台一直查不出结果，选卡也就无从谈起；挑一张占位卡把记录落下即可，
+    # 目的只是让人能看到这个候选、并让它不再堵住队列。
+    placeholder_gpu = config_gen.select_target_gpu(s.storage) or rules.KNOWN_GPUS[0]
+    _needs_human_record(s, cand, placeholder_gpu, priority)
     s.storage.mark_candidate_processed(cand.model_id)
     s.storage.set_counter(key, 0)
     metrics.incr("uncertain_escalated")

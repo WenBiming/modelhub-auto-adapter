@@ -38,10 +38,12 @@ def test_tick_discovers_enqueues_and_submits(tmp_path, candidate):
 
 
 def test_tick_skips_duplicate_candidate(tmp_path, candidate):
+    """全部可提交的卡都已适配才算重复。只覆盖其中一张时，选卡会挑另一张空的——
+    那是"老模型上新卡"的合法新适配，不是重复（线上实测的核心场景）。"""
     storage = SqliteStorage(str(tmp_path / "t.db"))
     client = Mock()
     client.search_model.return_value = ModelSearchResult(
-        True, {}, {SELECTED_GPU: {"passed": True}})
+        True, {}, {g: {"passed": True} for g in rules.KNOWN_GPUS})
     client.list_my_tasks.return_value = {"records": []}
 
     class Src:
@@ -49,6 +51,7 @@ def test_tick_skips_duplicate_candidate(tmp_path, candidate):
         def fetch(self):
             return [candidate]
 
+    client.add_task.return_value = 12345  # Mock 会被写进 TaskRecord 再序列化，必须是真 id
     deps = Deps(settings=Settings(xc_token="t", strategy_id="s", base_url="https://x"),
                 storage=storage, client=client, sources=[Src()])
     tick(deps, threading.Event())
@@ -68,6 +71,7 @@ def test_tick_stops_immediately_when_stop_event_already_set(tmp_path, candidate)
         def fetch(self):
             return [candidate]
 
+    client.add_task.return_value = 12345  # Mock 会被写进 TaskRecord 再序列化，必须是真 id
     deps = Deps(settings=Settings(xc_token="t", strategy_id="s", base_url="https://x"),
                 storage=storage, client=client, sources=[Src()])
     stop_event = threading.Event()
@@ -123,6 +127,7 @@ def test_tick_resets_metrics_between_ticks(tmp_path, candidate, capsys):
         def fetch(self):
             return [candidate]
 
+    client.add_task.return_value = 12345  # Mock 会被写进 TaskRecord 再序列化，必须是真 id
     deps = Deps(settings=Settings(xc_token="t", strategy_id="s", base_url="https://x"),
                 storage=storage, client=client, sources=[Src()])
 
@@ -199,6 +204,7 @@ def test_candidates_per_tick_is_capped_and_remainder_stays_pending(tmp_path, can
     client = Mock()
     client.search_model.return_value = ModelSearchResult(True, {}, {SELECTED_GPU: {}})
     client.list_my_tasks.return_value = {"records": []}
+    client.add_task.return_value = 1  # 未覆盖的卡上会真的入队并提交，须给真 id
     many = [replace(candidate, model_id=f"org/m{i}")
             for i in range(main_module.MAX_CANDIDATES_PER_TICK + 5)]
 

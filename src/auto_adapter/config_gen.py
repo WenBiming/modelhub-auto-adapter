@@ -70,17 +70,22 @@ def resolve_framework(candidate) -> str:
     return rules.FALLBACK_FRAMEWORK
 
 
-def select_target_gpu(storage) -> str:
-    """选平台覆盖率最低的 GPU 型号（覆盖率缓存于 storage，由 eligibility 写入）。
+def select_target_gpu(storage, exclude: set[str] | None = None) -> str | None:
+    """在 rules.KNOWN_GPUS 里挑一张目标卡，排除 exclude 里的型号；无可选时返回 None。
 
-    v0.1 的实际效果：rules.KNOWN_GPUS 只有一个已确认型号，所以这里恒返回它。
-    扩充 KNOWN_GPUS（spec §9 上线前人工步骤）后本函数立即开始按覆盖率分流。
-    注意候选的 processed 标记按 model_id 记（不含 GPU）：一个模型在一段时间内只会
-    被适配到一张卡上，多卡覆盖靠不同模型分流实现，而不是同一模型逐卡重复提交——
-    这是防重复提交的保守取舍，要改成"每模型每卡各一次"必须同时改候选表主键。
+    exclude 由调用方传入"这个模型已经适配过的卡"——**必须逐候选计算**。
+    早先的实现每个 tick 只算一张全局的卡，线上实测的后果是：Ascend_910-b4 覆盖了
+    几乎所有热门模型，于是每个候选都被判重复跳过，智能体永远提交不出任何任务。
+    而同一批候选里其实有大量"这个模型还没上过那张卡"的新适配机会
+    （例：某 32B 模型只覆盖 8 张卡，我们能提交的 10 张里有 4 张是空的）。
+
+    多张可选时按平台覆盖率从低到高挑，让适配矩阵往稀疏处生长。
     """
     coverage = storage.gpu_coverage()
-    return min(rules.KNOWN_GPUS, key=lambda g: coverage.get(g, 0))
+    available = [g for g in rules.KNOWN_GPUS if g not in (exclude or set())]
+    if not available:
+        return None
+    return min(available, key=lambda g: coverage.get(g, 0))
 
 
 def render_config_params(framework: str, tp_size: int, max_model_len: int = 4096,

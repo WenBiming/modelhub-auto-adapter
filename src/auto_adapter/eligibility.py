@@ -16,6 +16,7 @@ from .platform_client import (
     PlatformClientError,
     escalate_if_credential_error,
 )
+from . import config_gen, rules
 from .storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -32,35 +33,34 @@ class Decision:
     verdict: Verdict
     priority: Priority | None = None       # 仅 ENQUEUE 时有值
     reason: str = ""
+    target_gpu: str | None = None          # 仅 ENQUEUE 时有值：为这个候选选中的卡
 
 
 def evaluate(
     candidate: CandidateModel,
-    target_gpu: str,
     storage: Storage,
     client: PlatformClient,
 ) -> Decision:
-    """分类矩阵（spec §4.3）：
+    """判定这个候选能否提交，并**为它单独选一张目标卡**（spec §4.3）。
 
-    - 任一已存在记录，不限状态             → SKIP_DUPLICATE（不查平台）
-    平台侧依据 client.search_model().verify_result（按 GPU 型号分键，spec 附录 A.4）：
-    - verify_result 无任何键             → ENQUEUE, NEW_MODEL
-    - 有键但无当前 target_gpu 的键       → ENQUEUE, NEW_ADAPTATION
-    - 有 target_gpu 的键且已通过         → SKIP_DUPLICATE
-    - 候选命中悬赏                      → ENQUEUE, BOUNTY（不覆盖 SKIP_DUPLICATE）
-    - 40400 NOT_FOUND                   → 平台从未见过该模型 = 空 verify_result（新模型）
-    - 其余异常/网络失败                  → SKIP_UNCERTAIN（宁漏勿重）
+    平台侧依据 client.search_model().verify_result（按 GPU 型号分键，附录 A.4）：
+    - KNOWN_GPUS 中存在该模型尚未适配、本地也无记录的卡 → ENQUEUE，选中那张卡
+        · verify_result 为空  → Priority.NEW_MODEL（平台从没见过这个模型）
+        · 否则               → Priority.NEW_ADAPTATION（老模型上新卡）
+    - 候选命中悬赏                        → Priority.BOUNTY（仍需有卡可选）
+    - KNOWN_GPUS 全被平台覆盖或本地占用     → SKIP_DUPLICATE，绝不提交
+    - 40400 NOT_FOUND                    → 平台没这个模型 = 空 verify_result（新模型）
+    - 其余异常/网络失败                    → SKIP_UNCERTAIN（宁漏勿重）
+
+    选卡必须逐候选做：线上实测 Ascend_910-b4 覆盖了几乎所有热门模型，用一张全局的卡
+    评估所有候选会让每个候选都被判重复，智能体一个任务也提交不出去。
     """
-    if storage.get_task(candidate.model_id, target_gpu) is not None:
-        return Decision(Verdict.SKIP_DUPLICATE, reason="local record exists")
     try:
         result = client.search_model(candidate.model_id)
     except PlatformClientError as e:
         if e.code == CODE_NOT_FOUND:
             # 40400 是"平台没有这个模型"的正常业务应答（附录 A.6），也是本系统存在
-            # 意义所在的 NEW_MODEL 分支最可能收到的响应——不是不确定。以前它被吞进
-            # SKIP_UNCERTAIN，而 SKIP_UNCERTAIN 的候选永不标 processed，于是每个 tick
-            # 重查一次、永远进不了队。
+            # 意义所在的 NEW_MODEL 分支最可能收到的响应——不是不确定。
             result = ModelSearchResult(is_in_db=False, model_info={}, verify_result={})
         else:
             escalate_if_credential_error(storage, e)
@@ -69,17 +69,29 @@ def evaluate(
         return Decision(Verdict.SKIP_UNCERTAIN, reason=f"platform query failed: {e}")
 
     _record_gpu_coverage(storage, result.verify_result)
-
+    covered = set(result.verify_result)
     logger.info("platform coverage for %s: %s",
-                candidate.model_id, sorted(result.verify_result.keys()) or "(none)")
-    if target_gpu in result.verify_result:
-        # GpuVerifyResult 内部字段未确认前，键存在即视为已覆盖（保守）
-        return Decision(Verdict.SKIP_DUPLICATE, reason=f"already verified on {target_gpu}")
+                candidate.model_id, sorted(covered) or "(none)")
+
+    # 本地已有记录的卡同样要排除：那些组合我们自己已经提交过/拉黑过。
+    locally_taken = {g for g in rules.KNOWN_GPUS
+                     if storage.get_task(candidate.model_id, g) is not None}
+
+    target_gpu = config_gen.select_target_gpu(storage, exclude=covered | locally_taken)
+    if target_gpu is None:
+        return Decision(
+            Verdict.SKIP_DUPLICATE,
+            reason=f"every known GPU already covered or locally recorded "
+                   f"({len(covered)} platform, {len(locally_taken)} local)")
+
     if candidate.is_bounty:
-        return Decision(Verdict.ENQUEUE, Priority.BOUNTY, reason="bounty")
-    if not result.verify_result:
-        return Decision(Verdict.ENQUEUE, Priority.NEW_MODEL, reason="no adaptation record")
-    return Decision(Verdict.ENQUEUE, Priority.NEW_ADAPTATION, reason="new gpu for model")
+        return Decision(Verdict.ENQUEUE, Priority.BOUNTY, reason="bounty",
+                        target_gpu=target_gpu)
+    if not covered:
+        return Decision(Verdict.ENQUEUE, Priority.NEW_MODEL,
+                        reason="no adaptation record", target_gpu=target_gpu)
+    return Decision(Verdict.ENQUEUE, Priority.NEW_ADAPTATION,
+                    reason=f"not yet adapted on {target_gpu}", target_gpu=target_gpu)
 
 
 def _record_gpu_coverage(storage: Storage, verify_result: dict) -> None:
