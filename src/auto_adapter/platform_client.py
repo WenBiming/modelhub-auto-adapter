@@ -22,6 +22,20 @@ REQUEST_TIMEOUT = 10
 # 就能换头名的口子，便于排查。值本身永远不进日志。
 AUTH_HEADER = os.environ.get("AUTH_HEADER", "Xc-Token")
 
+# 鉴权方案候选。平台只注入 EXTERNAL_SERVICE_TOKEN（线上环境变量清单实证：没有
+# XcToken 之类），而它用文档写明的 Xc-Token 头发过去被 401 拒绝。令牌本身应当是对的，
+# 差的是"怎么带"。与其每试一个头名就改 Dockerfile 重新发版，不如启动时自己探一遍。
+#
+# 每个方案返回 (header_name, value_template)；探测只做只读 GET，且一旦命中立刻停手。
+AUTH_SCHEMES = (
+    ("Xc-Token", "{token}"),            # 开放平台文档写明的方案
+    ("Authorization", "Bearer {token}"),
+    ("Authorization", "{token}"),
+    ("X-Auth-Token", "{token}"),
+    ("token", "{token}"),
+    ("xc-token", "{token}"),            # 有些网关区分大小写
+)
+
 # 附录 A.6 错误码
 CODE_OK = 0
 CODE_NOT_LOGIN = 40100
@@ -102,6 +116,7 @@ class PlatformClient:
     def __init__(self, base_url: str, xc_token: str) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = requests.Session()
+        self._token = xc_token
         self._session.headers[AUTH_HEADER] = xc_token
         # 官方 API 文档的调用示例带 Accept，照做以免在内容协商上出现差异。
         self._session.headers["Accept"] = "application/json"
@@ -154,6 +169,49 @@ class PlatformClient:
             model_info=data.get("modelInfo") or {},
             verify_result=data.get("verifyResult") or {},
         )
+
+    def probe_auth(self) -> tuple[str, str] | None:
+        """依次试各鉴权方案，命中即改用它并返回 (头名, 模板)；全不通返回 None。
+
+        只做只读 GET（task/page 取一条），不会创建任何任务。日志里只出现头名与
+        模板形状，令牌值永不出现。
+
+        存在的理由：平台注入的凭据用文档写明的 Xc-Token 头被 401 拒绝，而平台界面
+        不提供环境变量入口——靠改 Dockerfile 逐个试头名，每试一次都要重新发版。
+        """
+        for header, template in AUTH_SCHEMES:
+            probe = requests.Session()
+            probe.headers[header] = template.format(token=self._token)
+            probe.headers["Accept"] = "application/json"
+            try:
+                resp = probe.get(self._base_url + "/api/adapt/task/page",
+                                 params={"current": 1, "pageSize": 1, "onlyMine": "true"},
+                                 timeout=REQUEST_TIMEOUT)
+            except Exception as e:
+                logger.warning("auth probe %r failed to connect: %s", header, e)
+                continue
+            if resp.status_code in (401, 403):
+                logger.info("auth probe: header %r with %r → %d (rejected)",
+                            header, template, resp.status_code)
+                continue
+            if resp.ok:
+                try:
+                    code = resp.json().get("code")
+                except ValueError:
+                    code = None
+                if code in (None, CODE_OK):
+                    logger.warning("auth probe: header %r with template %r ACCEPTED; "
+                                   "adopting it for this run. Set AUTH_HEADER to make it "
+                                   "explicit.", header, template)
+                    self._session.headers.pop(AUTH_HEADER, None)
+                    self._session.headers[header] = template.format(token=self._token)
+                    return header, template
+                logger.info("auth probe: header %r → business code %s", header, code)
+        logger.error(
+            "auth probe: none of %d schemes was accepted. The platform-injected "
+            "credential may not be an open-API token at all — ask the platform which "
+            "credential an agent should use.", len(AUTH_SCHEMES))
+        return None
 
     def stop_tasks(self, task_ids: list[int]) -> bool:
         """PUT /api/async/task/stop-create-contest-task，批量终止（附录 A.5）。"""

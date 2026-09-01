@@ -135,6 +135,13 @@ def _adopt_in_flight_tasks(deps: "Deps") -> bool:
         adopted = -1
 
     if adopted < 0:
+        if credential_failure and not deps.auth_probed:
+            # 令牌是平台给的，八成没错，错的是"怎么带"。探一遍标准方案；命中就换上
+            # 并立刻重试认领，省掉一整个"改 Dockerfile → 重新发版"的来回。
+            deps.auth_probed = True
+            if deps.client.probe_auth() is not None:
+                deps.storage.set_kill_switch(False, "auth scheme found by probe", source="")
+                return _adopt_in_flight_tasks(deps)
         if credential_failure:
             # 凭据错误已经拉过闸并写明了原因。再覆盖成通用的"认领失败"会做两件坏事：
             # 抹掉更精确的根因，并把它降级成可自动解除——令牌无效要人换令牌，
@@ -159,6 +166,7 @@ class Deps:
     storage: object
     client: object
     sources: list = field(default_factory=list)
+    auth_probed: bool = False  # 鉴权方案探测每个进程只做一次
 
 
 def build_deps(settings: Settings, stop_event=None) -> Deps:

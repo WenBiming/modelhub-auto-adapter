@@ -120,3 +120,40 @@ def test_sends_accept_json_like_the_documented_sample(client):
     client.list_my_tasks()
     assert responses.calls[0].request.headers["Accept"] == "application/json"
     assert responses.calls[0].request.headers["Xc-Token"] == "tok"
+
+
+@responses.activate
+def test_auth_probe_adopts_the_scheme_that_works():
+    """平台只注入 EXTERNAL_SERVICE_TOKEN（线上环境变量清单实证），而它用文档写明的
+    Xc-Token 头被 401 拒绝。令牌应当是对的，差的是"怎么带"——逐个试标准方案，
+    命中就换上，省掉一整个"改 Dockerfile 重新发版"的来回。"""
+    from auto_adapter.platform_client import AUTH_SCHEMES
+
+    def handler(request):
+        if request.headers.get("Authorization") == "Bearer tok":
+            return (200, {}, '{"code": 0, "message": "ok", "data": {"records": []}}')
+        return (401, {}, "")
+
+    responses.add_callback(responses.GET, f"{BASE}/api/adapt/task/page", callback=handler)
+    client = PlatformClient(BASE, xc_token="tok")
+
+    found = client.probe_auth()
+
+    assert found == ("Authorization", "Bearer {token}")
+    # 换上之后，后续正常调用应当通过
+    assert client.list_my_tasks()["records"] == []
+    assert ("Authorization", "Bearer {token}") in AUTH_SCHEMES
+
+
+@responses.activate
+def test_auth_probe_reports_failure_when_nothing_works():
+    responses.get(f"{BASE}/api/adapt/task/page", status=401)
+    assert PlatformClient(BASE, xc_token="tok").probe_auth() is None
+
+
+@responses.activate
+def test_auth_probe_never_creates_tasks():
+    """探测只做只读 GET——绝不能在探路时建出任务来。"""
+    responses.get(f"{BASE}/api/adapt/task/page", status=401)
+    PlatformClient(BASE, xc_token="tok").probe_auth()
+    assert all(c.request.method == "GET" for c in responses.calls)
