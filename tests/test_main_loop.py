@@ -39,7 +39,8 @@ def test_health_starts_before_config_validation_and_survives_bad_config(monkeypa
 
     from auto_adapter import health, main as main_mod
 
-    for k in ("XC_TOKEN", "EXTERNAL_SERVICE_TOKEN", "STRATEGY_ID"):
+    from auto_adapter import settings as _s
+    for k in (*_s.TOKEN_ENV_VARS, "STRATEGY_ID"):
         monkeypatch.delenv(k, raising=False)
 
     order = []
@@ -60,7 +61,7 @@ def test_health_starts_before_config_validation_and_survives_bad_config(monkeypa
 
     assert order[0] == "health", "健康检查必须先于配置校验启动"
     assert order[1][0] == "idle"
-    assert "EXTERNAL_SERVICE_TOKEN" in order[1][1]
+    assert "missing platform credential" in order[1][1]
 
 
 def test_health_status_endpoint_reports_config_error():

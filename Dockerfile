@@ -22,14 +22,15 @@ ENV STORAGE_PATH=/app/data/agent.db
 # 需要回到演练模式排查问题时，把这里改回 true 再发一个 tag。
 ENV DRY_RUN=false
 
-# ── 平台凭据 ─────────────────────────────────────────────────────────────
-# 平台注入的 EXTERNAL_SERVICE_TOKEN 会被开放平台 API 以 401 拒绝，而平台界面又不提供
-# 设置环境变量的入口，所以有效的 xcToken 只能写在这里。留空时回退到平台注入值。
+# ── 平台凭据：绝不写在这里 ────────────────────────────────────────────────
+# 这里曾经硬编码过一个 xcToken，随公开仓库泄露过一次（令牌已作废）。
 #
-# ⚠️ 写进来的令牌会进入镜像层与 git 历史，**即使之后改掉也留在历史里**。
-#    因此：仓库必须保持 private；用完这个智能体后去平台重新生成一次令牌。
-#    换令牌只改这一行。
-ENV XC_TOKEN=751bbddc7b7b48428375909ab9d8824b
+# 镜像层是明文的，`docker history` / `docker inspect` 都能读出来；写进 Dockerfile
+# 还会同时进入 git 历史，**改掉之后依然留在历史里**。仓库又是公开的，等于直接公布。
+#
+# 令牌只能在运行时进入进程：平台注入，或本地 `docker run -e XC_TOKEN=...`
+# （见 scripts/dry-run-local.sh，它用隐藏输入读取，不进 shell history）。
+# tests/test_no_secrets_in_image.py 会拦住再次写入的尝试。
 
 # 平台内网连不上 huggingface.co（线上实测 connect timeout），默认关闭该来源，
 # 只用国内可达的 ModelScope。若你的环境有 HF 镜像，设 HF_ENDPOINT 后再打开。

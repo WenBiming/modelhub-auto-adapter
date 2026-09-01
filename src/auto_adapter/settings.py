@@ -21,7 +21,41 @@ DEFAULT_STORAGE_PATH = "/app/data/agent.db"
 # XC_TOKEN 在前是刻意的：平台注入的 EXTERNAL_SERVICE_TOKEN 被开放平台 API 以 401
 # 拒绝（线上实测），运维只能自行配一个有效的 xcToken——**显式配置必须能压过平台
 # 的默认注入**，否则那个无效令牌会一直盖掉你配的这个，而症状只是一句 401。
-TOKEN_ENV_VARS = ("XC_TOKEN", "EXTERNAL_SERVICE_TOKEN")
+TOKEN_ENV_VARS = (
+    "XC_TOKEN",                # 本地/运维显式配置，优先级最高
+    "XcToken",                 # 平台 API 文档里的请求头名，注入时可能同名
+    "xcToken",
+    "XCTOKEN",
+    "EXTERNAL_SERVICE_TOKEN",  # 官方 demo 读的名字（线上实测被 401 拒绝）
+)
+
+# 兜底扫描时排除：含 token 字样但不是平台凭据。
+_TOKEN_SCAN_EXCLUDE = frozenset({"AUTH_HEADER"})
+
+
+def token_env_candidates() -> list[str]:
+    """环境里所有名字含 token 的变量名（不区分大小写），排序返回。**只有名字**。
+
+    平台到底注入了什么，文档没说全，官方 demo 读的那个又被 401 拒绝。穷举候选之外
+    再扫一遍，让智能体自己找到能用的那个，同时把找到的名字暴露出来供诊断。
+    """
+    return sorted(
+        name for name, value in os.environ.items()
+        if "token" in name.lower() and value and name not in _TOKEN_SCAN_EXCLUDE)
+
+
+def resolve_token_env_name() -> str | None:
+    """选出实际使用的令牌变量名，**只在 TOKEN_ENV_VARS 白名单内取**。
+
+    刻意不拿兜底扫描的结果直接用：环境里任何含 token 字样的变量都可能是别的服务的
+    凭据（CI 令牌之类），把它当作 Xc-Token 发给 modelhub.org.cn 就是把无关凭据
+    泄露给第三方。扫描结果只用于诊断（token_env_candidates），要用哪个由人决定，
+    加进白名单或直接设 XC_TOKEN。
+    """
+    for name in TOKEN_ENV_VARS:
+        if os.environ.get(name):
+            return name
+    return None
 
 
 class ConfigError(Exception):
@@ -34,6 +68,7 @@ class Settings:
     strategy_id: str
     base_url: str = DEFAULT_BASE_URL
     dry_run: bool = False
+    token_env_name: str = ""  # 令牌取自哪个环境变量（只记名字，便于诊断）
     storage_path: str = DEFAULT_STORAGE_PATH
     tick_seconds: int = 60
     max_submits_per_minute: int = 2
@@ -49,6 +84,11 @@ class Settings:
     # 20 个。等平台确认了其他框架的启动命令再放开（spec §9）。
     discovery_task_types: tuple[str, ...] = ("text-generation",)
 
+    @staticmethod
+    def token_env_candidates_snapshot() -> list[str]:
+        """诊断用：环境里所有含 token 字样的变量名。只有名字，没有值。"""
+        return token_env_candidates()
+
     @classmethod
     def from_env(cls) -> "Settings":
         """读取环境变量。缺失/非法一律抛 ConfigError，由 main 转成可诊断的存活态。"""
@@ -60,17 +100,25 @@ class Settings:
             raise ConfigError(
                 "TICK_SECONDS must be >= 60 (rate limit assumes one drain per minute)")
 
-        token = next((os.environ[k] for k in TOKEN_ENV_VARS if os.environ.get(k)), "")
-        if not token:
+        token_env = resolve_token_env_name()
+        if token_env is None:
+            seen = token_env_candidates()
             raise ConfigError(
-                "missing platform credential: set EXTERNAL_SERVICE_TOKEN "
-                "(injected by the platform) or XC_TOKEN for local runs")
+                "missing platform credential: none of "
+                f"{', '.join(TOKEN_ENV_VARS)} is set. "
+                + (f"Environment does contain token-looking variables: {', '.join(seen)} "
+                   "— if one of those is the platform credential, add its name to "
+                   "TOKEN_ENV_VARS (it is not used automatically, because an unrelated "
+                   "token must never be sent to the platform)."
+                   if seen else "No token-looking variable is present at all."))
+        token = os.environ[token_env]
         strategy_id = os.environ.get("STRATEGY_ID", "")
         if not strategy_id:
             raise ConfigError("missing STRATEGY_ID (the platform injects it at runtime)")
 
         return cls(
             xc_token=token,
+            token_env_name=token_env,
             strategy_id=strategy_id,
             base_url=os.environ.get("MODELHUB_BASE_URL") or DEFAULT_BASE_URL,
             dry_run=os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes"),

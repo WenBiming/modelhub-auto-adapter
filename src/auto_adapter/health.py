@@ -17,7 +17,8 @@ from flask import Flask
 app = Flask(__name__)
 
 # 由 main 在启动过程中更新；健康检查线程只读。
-_state: dict = {"status": "starting", "config_error": None, "dry_run": None}
+_state: dict = {"status": "starting", "config_error": None, "dry_run": None,
+                "token_env": None}
 _lock = threading.Lock()
 
 

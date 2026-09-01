@@ -11,13 +11,14 @@ handle 前），metrics 逐项计数，tick 末尾 flush 后清零（逐 tick �
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 import time
 from dataclasses import dataclass, field
 
-from . import (config_gen, eligibility, failure, health, metrics, monitor, rules,
-               submitter)
+from . import (config_gen, eligibility, failure, health, metrics, monitor,
+               platform_client, rules, submitter)
 from .discovery import base as discovery
 from .discovery.bounty import ManualBountySource
 from .discovery.huggingface import HuggingFaceSource
@@ -74,14 +75,23 @@ def main() -> None:
     # 校验失败就"存活但不工作"，把原因写进 / 端点和日志（见下）。
     health.start_in_background(port=8080)
 
+    # 平台到底注入了哪些环境变量，文档没说全（只提了 STRATEGY_ID，demo 用的是
+    # EXTERNAL_SERVICE_TOKEN 而它被 401 拒绝）。把**变量名**打出来是唯一可靠的
+    # 判定方式——名字不是机密，值才是，值永远不进日志。
+    logger.info("environment variables visible to the agent: %s",
+                ", ".join(sorted(os.environ)) or "(none)")
+
     try:
         settings = Settings.from_env()
     except ConfigError as e:
-        health.set_state(status="misconfigured", config_error=str(e))
+        health.set_state(status="misconfigured", config_error=str(e),
+                         token_env_candidates=Settings.token_env_candidates_snapshot())
         logger.error("configuration error: %s", e)
         _idle_until_stopped(stop_event, str(e))
         return
 
+    logger.info("using credential from environment variable %r (value never logged); "
+                "auth header %r", settings.token_env_name, platform_client.AUTH_HEADER)
     if settings.dry_run:
         logger.warning(
             "DRY RUN enabled: the agent will discover, dedup and build requests, "
@@ -98,7 +108,8 @@ def main() -> None:
         return
 
     _adopt_in_flight_tasks(deps)  # 失败不阻塞启动：每个 tick 会重试并在成功后自动解闸
-    health.set_state(status="running", config_error=None, dry_run=settings.dry_run)
+    health.set_state(status="running", config_error=None, dry_run=settings.dry_run,
+                     token_env=settings.token_env_name)
     run_loop(lambda: tick(deps, stop_event), stop_event, settings.tick_seconds)
 
 
